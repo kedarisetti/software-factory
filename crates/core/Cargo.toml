@@ -1,0 +1,9 @@
+[package]
+name = "sf-core"
+version = "0.0.0"
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+serde_json = "1"

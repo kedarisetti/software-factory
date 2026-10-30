@@ -870,6 +870,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sf-cli"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "sf-core",
+ "sf-orchestrator",
+ "sf-sandbox-local",
+ "sf-store-sqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "sf-core"
 version = "0.0.0"
 dependencies = [
@@ -934,6 +946,7 @@ name = "sf-store-sqlite"
 version = "0.0.0"
 dependencies = [
  "rusqlite",
+ "serde",
  "serde_json",
  "sf-core",
  "tempfile",

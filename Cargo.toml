@@ -10,6 +10,9 @@ repository = "https://github.com/kedarisetti/software-factory"
 sf-core = { path = "crates/core" }
 sf-kb = { path = "crates/kb" }
 sf-retrieval-tantivy = { path = "crates/retrieval-tantivy" }
+sf-orchestrator = { path = "crates/orchestrator" }
+sf-store-sqlite = { path = "crates/store-sqlite" }
+sf-sandbox-local = { path = "crates/sandbox-local" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 serde_json = "1"

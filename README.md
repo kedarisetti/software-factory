@@ -15,6 +15,7 @@ crates/orchestrator/       # run lifecycle, checkpoints, timers
 crates/store-sqlite/       # local durable log (WAL, synchronous=FULL)
 crates/retrieval-tantivy/  # BM25 index over knowledge + learnings (a cache)
 crates/sandbox-local/      # isolated tool execution
+crates/cli/                # `sf` binary: composition root for the durable core (M2)
 adapters/                  # thin Pi extension + Claude Code MCP config
 scripts/m1-exit-test.sh    # M1 exit test: Pi and Claude Code share one store
 agents/                    # Python/TS agent glue
@@ -31,3 +32,18 @@ target/release/sf-kb search "toolchain"
 ```
 
 Wire it into agents with [adapters/pi](adapters/pi/README.md) and [adapters/claude-code](adapters/claude-code/README.md).
+
+## Try the durable core
+
+```
+cargo build -p sf-cli
+export SF_DEMO_SIDE_EFFECT_FILE=/tmp/sf-side.txt
+sf=target/debug/sf
+RUN=$($sf --db /tmp/sf.db start demo | sed 's/.*"run_id":"\([^"]*\)".*/\1/')
+$sf --db /tmp/sf.db run              # parks at the approval step
+$sf --db /tmp/sf.db status $RUN
+$sf --db /tmp/sf.db approve $RUN && $sf --db /tmp/sf.db run
+$sf --db /tmp/sf.db events $RUN
+```
+
+Kill `sf run` at any point and rerun it: the run resumes and the side effect is not repeated. See [docs/baseline.md](docs/baseline.md).

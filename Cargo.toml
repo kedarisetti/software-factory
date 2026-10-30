@@ -10,3 +10,7 @@ repository = "https://github.com/kedarisetti/software-factory"
 sf-core = { path = "crates/core" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+serde_json = "1"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"

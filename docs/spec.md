@@ -104,6 +104,19 @@ Each requirement has an ID so tests, tickets and feedback can point at it. "Must
 - **LRN-4 (must):** A learning from a failed or reverted run is marked as such. A later contradicting outcome adds a `contradicts` link and expires it (ENT-4).
 - **LRN-5 (should):** A weekly review promotes frequently retrieved learnings into subagent prompts or tools, and drops learnings never retrieved.
 
+### Knowledge interfaces
+
+Knowledge is pluggable: Pi, Claude Code, Codex and the factory's own agents all read and write the same store, so what one agent learns compounds for every other.
+
+- **KIF-1 (must):** Knowledge is a standalone component. It runs without the orchestrator, and any agent harness can use it.
+- **KIF-2 (must):** The source of truth is plain files: one Markdown file per entry, with YAML frontmatter for tags, typed links, anchors, source, author, run ID and expiry. The BM25 index and metadata database are caches, rebuilt from the files.
+- **KIF-3 (must):** One core library with three front doors: a CLI (`sf-kb`) with JSON output, an MCP server, and a Rust crate. All three expose the same operations and behave identically.
+- **KIF-4 (must):** The contract has six operations: `search(query, task_class, top_k)`, `get(id)`, `add(entry)`, `learn(run, record)`, `feedback(id, verdict, note)` and `check_anchors()`.
+- **KIF-5 (must):** Every call records the calling agent (for example `pi`, `claude-code`, `factory`) and its run or session ID, so retrieval and learnings can be compared across agents (RET-4).
+- **KIF-6 (should):** Adapters stay thin and hold no logic: a Pi extension that wraps the CLI, and MCP configuration for MCP-capable agents.
+- **KIF-7 (should):** Concurrent writers are safe. Writes are atomic file renames plus an index lock, so several agents can learn at once.
+- **KIF-8 (should):** The contract is versioned. A breaking change bumps the version, and older clients get a clear error instead of wrong results.
+
 ### Triggers and intake
 
 - **TRG-1 (must):** Connectors (Slack, tickets, messages) write to a work queue. The queue is separate from the knowledge base.
@@ -209,13 +222,13 @@ The headline metric is cost per successful task, tracked monthly: if the loops w
 
 Each milestone ships only when its exit criteria pass. Dates are not set yet.
 
-1. **Durable core.** DUR-1 to DUR-6, SBX-4. Exit: a run survives a forced crash and a deploy mid-run; a retried step creates no duplicate side effect; cost baseline recorded.
-2. **Safe execution.** SBX-1 to SBX-3, approval gates, audit log. Exit: an injection test suite passes; every gated action parks and resumes on approval.
-3. **Verification loop.** FBK-1 to FBK-3, ENT-1. Exit: golden set runs in CI and blocks a seeded regression.
-4. **Knowledge.** KNO-1 to KNO-4. Exit: nightly anchor check runs; stale-anchor rate measured.
+1. **Knowledge service.** KIF-1 to KIF-8, KNO-1 to KNO-4, RET-1 to RET-6, LRN-1 to LRN-4. Exit: Pi (through its extension) and one MCP agent (Claude Code) both search and write learnings to the same store; every call is logged with its agent; the anchor check runs. Useful on its own before the orchestrator exists.
+2. **Durable core.** DUR-1 to DUR-6, SBX-4. Exit: a run survives a forced crash and a deploy mid-run; a retried step creates no duplicate side effect; cost baseline recorded.
+3. **Safe execution.** SBX-1 to SBX-3, approval gates, audit log. Exit: an injection test suite passes; every gated action parks and resumes on approval.
+4. **Verification loop.** FBK-1 to FBK-3, ENT-1. Exit: golden set runs in CI and blocks a seeded regression.
 5. **Intake.** TRG-1 to TRG-4. Exit: Slack and ticket connectors feed the queue with dedupe and the permission table enforced.
 6. **User surface.** UX-1 to UX-4. Exit: usability test meets the 30-second status target.
-7. **Entropy control.** ENT-2 to ENT-5. Exit: router live; first weekly removal review held.
+7. **Entropy control.** ENT-2 to ENT-10, LRN-5. Exit: router live; maintainability ratchet blocks a seeded regression; first weekly removal review held.
 
 ## Open questions
 

@@ -8,9 +8,13 @@ repository = "https://github.com/kedarisetti/software-factory"
 
 [workspace.dependencies]
 sf-core = { path = "crates/core" }
+sf-kb = { path = "crates/kb" }
+sf-retrieval-tantivy = { path = "crates/retrieval-tantivy" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 serde_json = "1"
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
+serde_yaml = "0.9"
+tantivy = "0.22"

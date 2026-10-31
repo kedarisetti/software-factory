@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod intake;
 mod sync;
 
 use serde_json::{json, Value};
@@ -350,6 +351,7 @@ fn main() {
     let registry = Registry::new();
     registry.register(demo());
     registry.register(ship());
+    registry.register(intake::triage());
     let engine = Engine::new(store.clone(), Arc::new(sb), Arc::new(SystemClock), registry);
     let arg = |i: usize| rest.get(i).cloned().unwrap_or_else(|| die("missing argument"));
     let approver = || {
@@ -371,6 +373,7 @@ fn main() {
     };
 
     let out = match cmd.as_str() {
+        "intake" => ex(intake::run(&rest[1..], store.clone(), &engine)),
         "feedback" => match arg(1).as_str() {
             "add" => {
                 let target = ex(parse_target(&named(&flags, "--target").unwrap_or_else(|| die("--target <t> is required"))));

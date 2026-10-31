@@ -14,6 +14,7 @@ sf-orchestrator = { path = "crates/orchestrator" }
 sf-store-sqlite = { path = "crates/store-sqlite" }
 sf-sandbox-local = { path = "crates/sandbox-local" }
 sf-eval = { path = "crates/eval" }
+sf-intake = { path = "crates/intake" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 serde_json = "1"

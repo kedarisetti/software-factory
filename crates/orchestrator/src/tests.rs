@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
-use sf_core::{AuditRecord, EgressAttempt, Lease, ActionKind, HostRule, SecretRef, verify_chain};
+use sf_core::{AuditRecord, EgressAttempt, Lease, ActionKind, HostRule, ItemStatus, Queue, SecretRef, WorkItem, verify_chain};
 
 use super::*;
 use crate::credentials::StaticCredentials;
@@ -725,4 +725,119 @@ fn clean_untrusted_passes() {
     })]);
     let id = env.engine().start_run("wf", "t", 0, 0).unwrap();
     assert_eq!(env.engine().tick(&id).unwrap(), RunState::Succeeded);
+}
+
+// ---- M5: intake ----
+
+#[test]
+fn input_is_durable_and_visible_to_steps() {
+    let env = Env::new();
+    let seen = Arc::new(Mutex::new(vec![]));
+    let s = seen.clone();
+    env.wf(1, vec![StepDef::new("s", move |c| {
+        s.lock().unwrap().push(c.input());
+        StepResult::Done(json!(1))
+    })]);
+    let e = env.engine();
+    let id = e.start_run_with_input("wf", "cli:1", 0, 0, json!({"text": "hi"})).unwrap();
+    assert_eq!(env.store.delivery(&format!("input:{id}")).unwrap(), Some(json!({"text": "hi"})));
+    e.tick(&id).unwrap();
+    let plain = e.start_run("wf", "cli:2", 0, 0).unwrap();
+    e.tick(&plain).unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![Some(json!({"text": "hi"})), None]);
+    assert!(matches!(e.deliver(&format!("input:{id}"), &json!({})), Err(Error::Forbidden(_))));
+}
+
+#[test]
+fn chat_trigger_cannot_deploy_even_with_auto_policy() {
+    let env = Env::new();
+    let ran = gated_wf(&env, Policy::default().gate_override(ActionKind::Deploy, Gate::Auto), act(ActionKind::Deploy, json!({})));
+    let e = env.engine();
+    let id = e.start_run("wf", "slack:C1/1.0", 0, 0).unwrap();
+    e.tick(&id).unwrap();
+    assert_eq!(env.state(&id), RunState::Escalated);
+    assert_eq!(n(&ran), 0);
+    assert_eq!(env.store.get_steps(&id).unwrap()[0].attempt, 1);
+    let log = env.audit();
+    assert!(log.iter().any(|r| r.decision == Decision::Blocked && r.action == "deploy"));
+    // a human resume re-runs the step and is blocked again: approval cannot override
+    e.resume_escalated(&id, "bob").unwrap();
+    e.tick(&id).unwrap();
+    assert_eq!(env.state(&id), RunState::Escalated);
+    assert_eq!(n(&ran), 0);
+}
+
+#[test]
+fn non_chat_trigger_deploy_still_gated_and_lookalike_prefix_is_not_chat() {
+    let env = Env::new();
+    let ran = gated_wf(&env, Policy::default(), act(ActionKind::Deploy, json!({})));
+    let e = env.engine();
+    for t in ["github:org/repo#1", "slackish:1"] {
+        let id = e.start_run("wf", t, 0, 0).unwrap();
+        e.tick(&id).unwrap();
+        assert_eq!(env.state(&id), RunState::AwaitingApproval, "{t}");
+    }
+    assert_eq!(n(&ran), 0);
+}
+
+#[test]
+fn chat_trigger_may_still_do_other_actions() {
+    let env = Env::new();
+    let ran = gated_wf(&env, Policy::default(), act(ActionKind::DraftPr, json!({})));
+    let e = env.engine();
+    let id = e.start_run("wf", "slack:C1/1.0", 0, 0).unwrap();
+    e.tick(&id).unwrap();
+    assert_eq!(env.state(&id), RunState::Succeeded);
+    assert_eq!(n(&ran), 1);
+}
+
+#[test]
+fn spent_since_sums_runs_created_at_or_after() {
+    let env = Env::new();
+    env.wf(1, vec![StepDef::new("s", |c| {
+        c.charge(100, 7);
+        StepResult::Done(json!(1))
+    })]);
+    let e = env.engine();
+    let a = e.start_run("wf", "t", 0, 0).unwrap();
+    e.tick(&a).unwrap();
+    env.advance(500);
+    let b = e.start_run("wf", "t", 0, 0).unwrap();
+    e.tick(&b).unwrap();
+    let c = e.start_run("wf", "t", 0, 0).unwrap(); // queued, no spend
+    assert_eq!(e.spent_since(0).unwrap(), (200, 14));
+    assert_eq!(e.spent_since(1_500).unwrap(), (100, 7));
+    assert_eq!(e.spent_since(9_999).unwrap(), (0, 0));
+    let _ = c;
+}
+
+fn qitem(id: &str, key: &str, priority: i32, at: u64) -> WorkItem {
+    WorkItem {
+        item_id: id.into(), source: "slack".into(), source_ref: "r".into(), dedupe_key: key.into(),
+        actor: "U1".into(), channel: "C1".into(), workflow: None, priority, status: ItemStatus::Queued,
+        reason: None, run_id: None, payload: json!({}), received_at: at, updated_at: at,
+    }
+}
+
+#[test]
+fn memory_queue_matches_contract() {
+    let s = MemoryStore::new();
+    let (a, fresh) = s.enqueue(&qitem("a", "k", 0, 1)).unwrap();
+    assert!(fresh);
+    let (b, fresh) = s.enqueue(&qitem("b", "k", 9, 2)).unwrap();
+    assert!(!fresh);
+    assert_eq!(a, b);
+    s.enqueue(&qitem("c", "c", 5, 3)).unwrap();
+    s.enqueue(&qitem("d", "d", 5, 2)).unwrap();
+    let ids: Vec<_> = s.list_items(&[ItemStatus::Queued], 10).unwrap().into_iter().map(|i| i.item_id).collect();
+    assert_eq!(ids, ["d", "c", "a"]);
+    assert_eq!(s.list_items(&[ItemStatus::Queued], 1).unwrap().len(), 1);
+    assert_eq!(s.count_items_since("slack", Some("U1"), 2).unwrap(), 2);
+    assert_eq!(s.count_items_since("slack", Some("U2"), 0).unwrap(), 0);
+    let mut x = s.get_item("a").unwrap().unwrap();
+    x.status = ItemStatus::Started;
+    x.run_id = Some("r1".into());
+    s.update_item(&x).unwrap();
+    assert_eq!(s.get_item("a").unwrap(), Some(x));
+    assert!(matches!(s.update_item(&qitem("zz", "zz", 0, 0)), Err(Error::NotFound(_))));
 }

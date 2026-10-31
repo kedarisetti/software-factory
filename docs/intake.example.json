@@ -1,0 +1,28 @@
+{
+  "slack": {
+    "signing_secret_env": "SF_SLACK_SIGNING_SECRET",
+    "bot_user_id": "U0FACTORY",
+    "channel_defaults": { "C0FACTORY": "demo" }
+  },
+  "github": { "webhook_secret_env": "SF_GITHUB_WEBHOOK_SECRET" },
+  "permissions": {
+    "deploy_workflows": ["ship"],
+    "rules": [
+      { "source": "slack", "channel": "C0FACTORY", "workflows": ["demo", "triage"] },
+      { "source": "github", "channel": "kedarisetti/software-factory", "workflows": ["triage", "demo", "ship"] }
+    ]
+  },
+  "rate": { "window_ms": 3600000, "per_source": { "slack": 60, "github": 60 }, "per_actor": 20 },
+  "near_dup_window_ms": 600000,
+  "priority": {
+    "base": { "github": 10, "slack": 5 },
+    "rules": [
+      { "name": "p0", "labels": ["p0", "priority:p0"], "keywords": ["p0"], "score": 100 },
+      { "name": "incident", "labels": ["incident", "sev1"], "keywords": ["incident", "outage"], "score": 80 },
+      { "name": "urgent", "labels": ["urgent"], "keywords": ["urgent", "asap"], "score": 50 },
+      { "name": "p2", "labels": ["p2", "priority:p2"], "keywords": [], "score": -20 },
+      { "name": "nice-to-have", "labels": ["nice-to-have"], "keywords": ["nice to have"], "score": -30 }
+    ]
+  },
+  "budget": { "run_tokens": 50000, "run_usd_micros": 5000000, "daily_tokens": 500000, "daily_usd_micros": 20000000 }
+}

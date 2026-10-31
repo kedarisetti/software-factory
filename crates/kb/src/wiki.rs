@@ -103,7 +103,8 @@ fn entry_line(e: &Entry, href: &str) -> String {
     let m = &e.meta;
     let mut line = format!("- [{}]({href}.md)", m.title.replace('[', "(").replace(']', ")").replace('\n', " "));
     let sum = summary(&e.body);
-    if !sum.is_empty() {
+    // Learnings usually have body == title; repeating it adds nothing.
+    if !sum.is_empty() && !m.title.starts_with(sum.trim_end_matches(['.', '…'])) {
         line.push_str(&format!(": {sum}"));
     }
     match m.status {

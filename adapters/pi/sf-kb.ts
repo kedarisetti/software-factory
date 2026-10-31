@@ -26,7 +26,7 @@ export default function (pi: ExtensionAPI) {
     });
 
   call("kb_search", "KB search",
-    "Search the shared knowledge base. Call this BEFORE starting a task: it holds conventions, glossary and learnings from earlier runs of every agent.",
+    "Search the shared knowledge base (conventions, glossary, learnings from earlier runs, synthesis pages). Call this FIRST at the start of a task, with the task's own wording unchanged; reformulate only on later calls. Returns paths (ids) + titles + snippets; then kb_get only the few that look relevant.",
     Type.Object({
       query: Type.String({ description: "Free-text query" }),
       task_class: Type.Optional(Type.String({ description: "Task class filter, e.g. fix-ci" })),
@@ -35,25 +35,34 @@ export default function (pi: ExtensionAPI) {
     (p) => ["search", p.query, ...(p.task_class ? ["--task-class", p.task_class] : []), ...(p.top_k ? ["--top-k", String(p.top_k)] : [])]);
 
   call("kb_get", "KB get",
-    "Read one knowledge entry in full by id (ids come from kb_search hits).",
-    Type.Object({ id: Type.String({ description: "Entry id" }) }),
+    "Read one knowledge entry in full by id. Read only the narrowed candidates from kb_search or kb_list; the id is its path, e.g. learnings/fix-ci/pin-the-rust-toolchain.",
+    Type.Object({ id: Type.String({ description: "Entry id: its path without .md" }) }),
     (p) => ["get", p.id]);
 
+  call("kb_list", "KB list",
+    "Browse one folder of the knowledge wiki: sub-folders with entry counts, and entries with title and summary. Start at \"\" for the root index. Best for \"everything about X\" questions, or when kb_search misses.",
+    Type.Object({ path: Type.Optional(Type.String({ description: "Folder, e.g. learnings/fix-ci; empty for the root" })) }),
+    (p) => ["list", ...(p.path ? [p.path] : [])]);
+
   call("kb_add", "KB add",
-    "Save a durable fact worth keeping (convention, glossary term, note) as a knowledge entry. Use kb_learn for end-of-task lessons.",
+    "Save a durable fact worth keeping (convention, glossary term, note). For a synthesis page over several entries use kind \"page\" and link each source with derived-from. Use kb_learn for end-of-task lessons.",
     Type.Object({
       title: Type.String(),
       body: Type.String({ description: "Markdown body" }),
-      kind: Type.Optional(StringEnum(["note", "learning", "glossary", "convention"] as const)),
+      kind: Type.Optional(StringEnum(["note", "learning", "glossary", "convention", "page"] as const)),
       tags: Type.Optional(Type.Array(Type.String())),
       task_class: Type.Optional(Type.String()),
       source: Type.Optional(Type.String({ description: "URL, ticket, file" })),
       ttl_ms: Type.Optional(Type.Number({ description: "Expire after this many ms" })),
+      links: Type.Optional(Type.Array(Type.Object({
+        type: StringEnum(["depends-on", "supersedes", "contradicts", "derived-from"] as const),
+        target: Type.String({ description: "Target entry id" }),
+      }))),
     }),
     (p) => ["add", "--json", JSON.stringify(p)]);
 
   call("kb_learn", "KB learn",
-    "Call at the END of a task to record what worked, what failed, dead ends and the shortest path, so later runs start ahead.",
+    "Call at the END of a task (after search, get, list) to record what worked, what failed, dead ends and the shortest path, so later runs start ahead.",
     Type.Object({
       task_class: Type.String(),
       worked: Type.Optional(Type.Array(Type.String())),

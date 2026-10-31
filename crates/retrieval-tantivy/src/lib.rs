@@ -13,9 +13,11 @@ use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
 use tantivy::{doc, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-/// RET-1 field weights: tags highest, then title, anchor paths, link targets, body.
+/// RET-1 field weights: tags highest, then title and path words, anchor paths, link targets, body.
 pub const BOOST_TAGS: f32 = 3.0;
 pub const BOOST_TITLE: f32 = 2.0;
+/// The entry's ID words (`learnings fix ci pin the rust toolchain`): the wiki path is a descriptive field (WIKI-1).
+pub const BOOST_PATH: f32 = 2.0;
 pub const BOOST_ANCHORS: f32 = 1.5;
 pub const BOOST_LINKS: f32 = 1.0;
 pub const BOOST_BODY: f32 = 1.0;
@@ -30,6 +32,7 @@ fn ix<E: std::fmt::Display>(e: E) -> Error {
 struct Fields {
     id: Field,
     title: Field,
+    path: Field,
     tags: Field,
     anchors: Field,
     links: Field,
@@ -43,6 +46,7 @@ fn build_schema() -> (Schema, Fields) {
     let f = Fields {
         id: b.add_text_field("id", STRING | STORED),
         title: b.add_text_field("title", TEXT),
+        path: b.add_text_field("path", TEXT),
         tags: b.add_text_field("tags", TEXT),
         anchors: b.add_text_field("anchors", TEXT),
         links: b.add_text_field("links", TEXT),
@@ -114,6 +118,7 @@ impl TantivyIndex {
         doc!(
             self.f.id => m.id.as_str(),
             self.f.title => m.title.as_str(),
+            self.f.path => m.id.replace(['/', '-'], " "),
             self.f.tags => m.tags.join(" "),
             self.f.anchors => join(m.anchors.iter().map(|a| a.path.as_str()).collect()),
             self.f.links => join(m.links.iter().map(|l| l.target.as_str()).collect()),
@@ -159,10 +164,11 @@ impl Index for TantivyIndex {
             return Ok(vec![]);
         }
         let f = self.f;
-        let mut parser = QueryParser::for_index(&self.index, vec![f.title, f.tags, f.body, f.anchors, f.links]);
+        let mut parser = QueryParser::for_index(&self.index, vec![f.title, f.path, f.tags, f.body, f.anchors, f.links]);
         for (field, boost) in [
             (f.tags, BOOST_TAGS),
             (f.title, BOOST_TITLE),
+            (f.path, BOOST_PATH),
             (f.anchors, BOOST_ANCHORS),
             (f.links, BOOST_LINKS),
             (f.body, BOOST_BODY),
@@ -216,7 +222,7 @@ mod tests {
                 status: EntryStatus::Active,
                 outcome: None,
                 count: 1,
-                source_runs: vec![],
+                source_runs: vec![], key: None,
                 helped: 0,
                 misled: 0,
             },
@@ -229,85 +235,94 @@ mod tests {
     }
 
     #[test]
+    fn path_words_are_searchable() {
+        let ix = TantivyIndex::in_memory().unwrap();
+        ix.upsert(&entry("learnings/fix-ci/pin-the-rust-toolchain", "Zzz", &[], "unrelated")).unwrap();
+        ix.upsert(&entry("notes/general/other", "Zzz", &[], "unrelated")).unwrap();
+        assert_eq!(ids(ix.search("toolchain", None, 5).unwrap()), ["learnings/fix-ci/pin-the-rust-toolchain"]);
+        assert_eq!(ids(ix.search("fix ci", None, 5).unwrap()), ["learnings/fix-ci/pin-the-rust-toolchain"]);
+    }
+
+    #[test]
     fn upsert_then_search() {
         let ix = TantivyIndex::in_memory().unwrap();
-        ix.upsert(&entry("a", "Cache", &[], "invalidate the cache nightly")).unwrap();
-        assert_eq!(ids(ix.search("cache", None, 5).unwrap()), ["a"]);
+        ix.upsert(&entry("notes/general/a", "Cache", &[], "invalidate the cache nightly")).unwrap();
+        assert_eq!(ids(ix.search("cache", None, 5).unwrap()), ["notes/general/a"]);
         assert!(ix.search("nothing", None, 5).unwrap().is_empty());
     }
 
     #[test]
     fn tag_outranks_body() {
         let ix = TantivyIndex::in_memory().unwrap();
-        ix.upsert(&entry("body", "x", &[], "kubernetes")).unwrap();
-        ix.upsert(&entry("tag", "y", &["kubernetes"], "other words")).unwrap();
-        assert_eq!(ids(ix.search("kubernetes", None, 5).unwrap()), ["tag", "body"]);
+        ix.upsert(&entry("notes/general/body", "x", &[], "kubernetes")).unwrap();
+        ix.upsert(&entry("notes/general/tag", "y", &["kubernetes"], "other words")).unwrap();
+        assert_eq!(ids(ix.search("kubernetes", None, 5).unwrap()), ["notes/general/tag", "notes/general/body"]);
     }
 
     #[test]
     fn anchors_and_links_are_indexed() {
         let ix = TantivyIndex::in_memory().unwrap();
-        let mut e = entry("a", "t", &[], "b");
+        let mut e = entry("notes/general/a", "t", &[], "b");
         e.meta.anchors.push(Anchor { repo: "r".into(), path: "widget".into(), lines: (1, 2), sha: "s".into() });
         e.meta.links.push(sf_kb::Link { kind: sf_kb::LinkType::DependsOn, target: "gadget".into() });
         ix.upsert(&e).unwrap();
-        assert_eq!(ids(ix.search("widget", None, 5).unwrap()), ["a"]);
-        assert_eq!(ids(ix.search("gadget", None, 5).unwrap()), ["a"]);
+        assert_eq!(ids(ix.search("widget", None, 5).unwrap()), ["notes/general/a"]);
+        assert_eq!(ids(ix.search("gadget", None, 5).unwrap()), ["notes/general/a"]);
     }
 
     #[test]
     fn task_class_filter() {
         let ix = TantivyIndex::in_memory().unwrap();
-        let mut a = entry("a", "t", &[], "word");
+        let mut a = entry("notes/general/a", "t", &[], "word");
         a.meta.task_class = Some("fix".into());
-        let mut b = entry("b", "t", &[], "word");
+        let mut b = entry("notes/general/b", "t", &[], "word");
         b.meta.task_class = Some("review".into());
-        let c = entry("c", "t", &[], "word");
+        let c = entry("notes/general/c", "t", &[], "word");
         [&a, &b, &c].iter().for_each(|e| ix.upsert(e).unwrap());
         let mut got = ids(ix.search("word", Some("fix"), 10).unwrap());
         got.sort();
-        assert_eq!(got, ["a", "c"]);
+        assert_eq!(got, ["notes/general/a", "notes/general/c"]);
         assert_eq!(ix.search("word", None, 10).unwrap().len(), 3);
     }
 
     #[test]
     fn inactive_never_returned() {
         let ix = TantivyIndex::in_memory().unwrap();
-        for (id, st) in [("e", EntryStatus::Expired), ("b", EntryStatus::BrokenAnchor), ("ok", EntryStatus::Active)] {
+        for (id, st) in [("notes/general/e", EntryStatus::Expired), ("notes/general/b", EntryStatus::BrokenAnchor), ("notes/general/ok", EntryStatus::Active)] {
             let mut e = entry(id, "t", &[], "word");
             e.meta.status = st;
             ix.upsert(&e).unwrap();
         }
-        assert_eq!(ids(ix.search("word", None, 1000).unwrap()), ["ok"]);
+        assert_eq!(ids(ix.search("word", None, 1000).unwrap()), ["notes/general/ok"]);
     }
 
     #[test]
     fn upsert_twice_no_duplicate() {
         let ix = TantivyIndex::in_memory().unwrap();
-        ix.upsert(&entry("a", "t", &[], "old")).unwrap();
-        ix.upsert(&entry("a", "t", &[], "new new")).unwrap();
-        assert_eq!(ids(ix.search("new OR old", None, 10).unwrap()), ["a"]);
+        ix.upsert(&entry("notes/general/a", "t", &[], "old")).unwrap();
+        ix.upsert(&entry("notes/general/a", "t", &[], "new new")).unwrap();
+        assert_eq!(ids(ix.search("new OR old", None, 10).unwrap()), ["notes/general/a"]);
         assert!(ix.search("old", None, 10).unwrap().is_empty());
     }
 
     #[test]
     fn remove_entry() {
         let ix = TantivyIndex::in_memory().unwrap();
-        ix.upsert(&entry("a", "t", &[], "word")).unwrap();
-        ix.remove("a").unwrap();
-        ix.remove("missing").unwrap();
+        ix.upsert(&entry("notes/general/a", "t", &[], "word")).unwrap();
+        ix.remove("notes/general/a").unwrap();
+        ix.remove("notes/general/missing").unwrap();
         assert!(ix.search("word", None, 10).unwrap().is_empty());
     }
 
     #[test]
     fn rebuild_replaces_everything() {
         let ix = TantivyIndex::in_memory().unwrap();
-        ix.upsert(&entry("old", "t", &[], "word")).unwrap();
-        let mut it = vec![entry("n1", "t", &[], "word"), entry("n2", "t", &[], "word")].into_iter();
+        ix.upsert(&entry("notes/general/old", "t", &[], "word")).unwrap();
+        let mut it = vec![entry("notes/general/n1", "t", &[], "word"), entry("notes/general/n2", "t", &[], "word")].into_iter();
         ix.rebuild(&mut it).unwrap();
         let mut got = ids(ix.search("word", None, 10).unwrap());
         got.sort();
-        assert_eq!(got, ["n1", "n2"]);
+        assert_eq!(got, ["notes/general/n1", "notes/general/n2"]);
     }
 
     #[test]
@@ -316,11 +331,11 @@ mod tests {
         let p = dir.path().join("idx");
         {
             let ix = TantivyIndex::open(&p).unwrap();
-            ix.upsert(&entry("a", "t", &[], "persisted")).unwrap();
+            ix.upsert(&entry("notes/general/a", "t", &[], "persisted")).unwrap();
         }
         let ix = TantivyIndex::open(&p).unwrap();
-        assert_eq!(ids(ix.search("persisted", None, 5).unwrap()), ["a"]);
-        ix.upsert(&entry("b", "t", &[], "persisted")).unwrap();
+        assert_eq!(ids(ix.search("persisted", None, 5).unwrap()), ["notes/general/a"]);
+        ix.upsert(&entry("notes/general/b", "t", &[], "persisted")).unwrap();
         assert_eq!(ix.search("persisted", None, 5).unwrap().len(), 2);
     }
 
@@ -331,8 +346,26 @@ mod tests {
         b.add_text_field("other", TEXT);
         tantivy::Index::create_in_dir(dir.path(), b.build()).unwrap();
         let ix = TantivyIndex::open(dir.path()).unwrap();
-        ix.upsert(&entry("a", "t", &[], "word")).unwrap();
+        ix.upsert(&entry("notes/general/a", "t", &[], "word")).unwrap();
         assert_eq!(ix.search("word", None, 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn index_without_path_field_is_wiped() {
+        // An index built before the "path" field existed must be recreated, not reused.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = Schema::builder();
+        for n in ["title", "tags", "anchors", "links", "body"] {
+            b.add_text_field(n, TEXT);
+        }
+        b.add_text_field("id", STRING | STORED);
+        b.add_text_field("task_class", STRING);
+        b.add_text_field("active", STRING);
+        tantivy::Index::create_in_dir(dir.path(), b.build()).unwrap();
+        let ix = TantivyIndex::open(dir.path()).unwrap();
+        assert!(ix.index.schema().get_field("path").is_ok());
+        ix.upsert(&entry("notes/general/a", "t", &[], "word")).unwrap();
+        assert_eq!(ids(ix.search("general", None, 5).unwrap()), ["notes/general/a"]);
     }
 
     #[test]
@@ -342,19 +375,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = TantivyIndex::open(dir.path()).unwrap();
         let b = TantivyIndex::open(dir.path()).unwrap();
-        a.upsert(&entry("a", "t", &[], "word")).unwrap();
-        b.upsert(&entry("b", "t", &[], "word")).unwrap();
+        a.upsert(&entry("notes/general/a", "t", &[], "word")).unwrap();
+        b.upsert(&entry("notes/general/b", "t", &[], "word")).unwrap();
         for ix in [&a, &b] {
             let mut ids: Vec<_> = ix.search("word", None, 10).unwrap().into_iter().map(|h| h.0).collect();
             ids.sort();
-            assert_eq!(ids, ["a", "b"]);
+            assert_eq!(ids, ["notes/general/a", "notes/general/b"]);
         }
     }
 
     #[test]
     fn garbage_queries_do_not_error() {
         let ix = TantivyIndex::in_memory().unwrap();
-        ix.upsert(&entry("a", "t", &[], "bar")).unwrap();
+        ix.upsert(&entry("notes/general/a", "t", &[], "bar")).unwrap();
         for q in ["foo:(bar AND", "\"unclosed", "(((", "a:b:c", "AND OR", "", "  ", "\\", "[1 TO"] {
             ix.search(q, None, 5).unwrap();
         }
@@ -364,15 +397,15 @@ mod tests {
     fn top_k_honoured_with_filters() {
         let ix = TantivyIndex::in_memory().unwrap();
         for i in 0..20 {
-            let mut e = entry(&format!("x{i}"), "t", &["word"], "word word word");
+            let mut e = entry(&format!("notes/general/x{i}"), "t", &["word"], "word word word");
             e.meta.status = EntryStatus::Expired;
             ix.upsert(&e).unwrap();
         }
         for i in 0..3 {
-            ix.upsert(&entry(&format!("a{i}"), "t", &[], "word")).unwrap();
+            ix.upsert(&entry(&format!("notes/general/a{i}"), "t", &[], "word")).unwrap();
         }
         let got = ids(ix.search("word", None, 3).unwrap());
         assert_eq!(got.len(), 3);
-        assert!(got.iter().all(|i| i.starts_with('a')));
+        assert!(got.iter().all(|i| i.starts_with("notes/general/a")));
     }
 }

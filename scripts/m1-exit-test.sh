@@ -28,5 +28,5 @@ for a in pi claude-code; do
   for op in search learn; do grep -q "\"agent\":\"$a\".*\"op\":\"$op\"" "$log" || fail "$a did not $op"; done
 done
 grep -q '"op":"check_anchors"' "$log" || fail "anchor check not logged"
-grep -q '^count: 2$' "$SF_KB_ROOT"/entries/learning-*.md || fail "learnings from both agents did not merge"
+grep -q '^count: 2$' "$SF_KB_ROOT"/learnings/fix-ci/*.md || fail "learnings from both agents did not merge"
 echo "PASS: both agents share one store ($SF_KB_ROOT)"

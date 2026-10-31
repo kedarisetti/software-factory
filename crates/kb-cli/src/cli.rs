@@ -63,10 +63,11 @@ fn json_arg(s: &str, what: &str) -> Result<Value, String> {
 /// Parse `args` (without the program name). `Err` is a usage error (exit code 2).
 pub fn parse(args: &[String], env: Env, stdin: Stdin) -> Result<(Globals, Cmd), String> {
     let (pos, flags) = split(args)?;
-    let sub = pos.first().ok_or("missing subcommand (search, get, add, learn, feedback, check-anchors, reindex, version, mcp)")?;
+    let sub = pos.first().ok_or("missing subcommand (search, get, list, add, learn, feedback, check-anchors, reindex, version, mcp)")?;
     let (allowed, arity): (&[&str], _) = match sub.as_str() {
         "search" => (&["task-class", "top-k"], 1..=usize::MAX),
         "get" => (&[], 1..=1),
+        "list" => (&[], 0..=1),
         "add" => (&["title", "body", "body-file", "tag", "task-class", "kind", "source", "ttl-ms", "json"], 0..=0),
         "learn" => (&["json"], 0..=0),
         "feedback" => (&["note"], 2..=2),
@@ -95,6 +96,7 @@ pub fn parse(args: &[String], env: Env, stdin: Stdin) -> Result<(Globals, Cmd), 
             Cmd::Op("search", a)
         }
         "get" => Cmd::Op("get", json!({ "id": rest[0] })),
+        "list" => Cmd::Op("list", json!({ "path": rest.first().map_or("", |p| p.trim_matches('/')) })),
         "add" => {
             let a = if let Some(j) = flags.get("json") {
                 json_arg(j, "--json")?
@@ -156,8 +158,10 @@ mod tests {
     fn search_and_get() {
         let (_, c) = p(&["search", "flaky", "ci", "--task-class", "fix", "--top-k", "3"]).unwrap();
         assert_eq!(c, Cmd::Op("search", json!({"query": "flaky ci", "task_class": "fix", "top_k": 3})));
-        let (_, c) = p(&["get", "e1"]).unwrap();
-        assert_eq!(c, Cmd::Op("get", json!({"id": "e1"})));
+        let (_, c) = p(&["get", "notes/general/e1"]).unwrap();
+        assert_eq!(c, Cmd::Op("get", json!({"id": "notes/general/e1"})));
+        assert_eq!(p(&["list"]).unwrap().1, Cmd::Op("list", json!({"path": ""})));
+        assert_eq!(p(&["list", "learnings/fix-ci/"]).unwrap().1, Cmd::Op("list", json!({"path": "learnings/fix-ci"})));
     }
 
     #[test]
@@ -184,7 +188,7 @@ mod tests {
 
     #[test]
     fn usage_errors() {
-        for bad in [&[][..], &["nope"], &["get"], &["get", "a", "b"], &["feedback", "a"], &["search", "q", "--top-k", "x"],
+        for bad in [&[][..], &["nope"], &["get"], &["get", "a", "b"], &["list", "a", "b"], &["feedback", "a"], &["search", "q", "--top-k", "x"],
                     &["search", "q", "--bogus", "1"], &["search", "q", "--top-k"], &["add", "--body", "b"], &["learn", "--json", "{"]] {
             assert!(p(bad).is_err(), "{bad:?}");
         }

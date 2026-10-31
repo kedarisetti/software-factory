@@ -1,0 +1,19 @@
+[package]
+name = "sf-cli"
+version = "0.0.0"
+edition.workspace = true
+
+[[bin]]
+name = "sf"
+path = "src/main.rs"
+
+[dependencies]
+sf-core.workspace = true
+sf-orchestrator.workspace = true
+sf-store-sqlite.workspace = true
+sf-sandbox-local.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true

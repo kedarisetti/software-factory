@@ -1,0 +1,18 @@
+Seeded regression (ENT-1): a tuning change raises the tag, title and path boosts to 10.0, so broad metadata matches drown out specific body matches.
+Expected: retrieval recall@5 and MRR fall below baseline tolerance at every ladder size.
+--- a/crates/retrieval-tantivy/src/lib.rs	2026-10-31 15:47:08.858385354 -0400
++++ b/crates/retrieval-tantivy/src/lib.rs	2026-10-31 15:48:42.559896212 -0400
+@@ -14,10 +14,10 @@
+ use tantivy::{doc, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+ 
+ /// RET-1 field weights: tags highest, then title and path words, anchor paths, link targets, body.
+-pub const BOOST_TAGS: f32 = 3.0;
+-pub const BOOST_TITLE: f32 = 2.0;
++pub const BOOST_TAGS: f32 = 10.0;
++pub const BOOST_TITLE: f32 = 10.0;
+ /// The entry's ID words (`learnings fix ci pin the rust toolchain`): the wiki path is a descriptive field (WIKI-1).
+-pub const BOOST_PATH: f32 = 2.0;
++pub const BOOST_PATH: f32 = 10.0;
+ pub const BOOST_ANCHORS: f32 = 1.5;
+ pub const BOOST_LINKS: f32 = 1.0;
+ pub const BOOST_BODY: f32 = 1.0;

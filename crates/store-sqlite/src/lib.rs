@@ -9,7 +9,9 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row, TransactionBehavior};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use sf_core::{AuditRecord, Commit, Decision, Error, Event, Result, Run, RunState, Step, Store};
+use sf_core::{
+    AuditRecord, Commit, Decision, Error, Event, Feedback, FeedbackTarget, Result, Run, RunState, Step, Store,
+};
 
 /// Migrations, applied in order; `PRAGMA user_version` records how many have run.
 const MIGRATIONS: &[&str] = &["
@@ -50,6 +52,19 @@ CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit
 BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
 CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit
 BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
+", "
+CREATE TABLE feedback (
+    seq INTEGER PRIMARY KEY, feedback_id TEXT UNIQUE NOT NULL, target TEXT NOT NULL,
+    target_kind TEXT NOT NULL, target_id TEXT NOT NULL, source TEXT NOT NULL,
+    verdict TEXT NOT NULL, note TEXT, author TEXT NOT NULL, ts INTEGER NOT NULL,
+    detail TEXT NOT NULL
+);
+CREATE INDEX feedback_target ON feedback(target_kind, target_id, seq);
+CREATE TRIGGER feedback_no_update BEFORE UPDATE ON feedback
+BEGIN SELECT RAISE(ABORT, 'feedback is append-only'); END;
+CREATE TRIGGER feedback_no_delete BEFORE DELETE ON feedback
+BEGIN SELECT RAISE(ABORT, 'feedback is append-only'); END;
+CREATE TABLE cursors (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 "];
 
 /// Durable [`Store`] on a local SQLite file.
@@ -163,6 +178,44 @@ fn audit_from(r: &Row) -> rusqlite::Result<Result<AuditRecord>> {
             hash: r.get(13).map_err(err)?,
         })
     })())
+}
+
+const FEEDBACK_COLS: &str = "seq, feedback_id, target, source, verdict, note, author, ts, detail";
+
+/// Indexed lookup key of a target: (kind, id). Steps are `run/step`.
+fn target_key(t: &FeedbackTarget) -> (&'static str, String) {
+    match t {
+        FeedbackTarget::Run { run_id } => ("run", run_id.clone()),
+        FeedbackTarget::Step { run_id, step_id } => ("step", format!("{run_id}/{step_id}")),
+        FeedbackTarget::Artifact { artifact, .. } => ("artifact", artifact.clone()),
+        FeedbackTarget::Entry { entry_id } => ("entry", entry_id.clone()),
+        FeedbackTarget::Template { section } => ("template", section.clone()),
+    }
+}
+
+fn feedback_from(r: &Row) -> rusqlite::Result<Result<Feedback>> {
+    let (target, source, verdict, detail): (String, String, String, String) =
+        (r.get(2)?, r.get(3)?, r.get(4)?, r.get(8)?);
+    Ok((|| {
+        Ok(Feedback {
+            seq: r.get::<_, i64>(0).map_err(err)? as u64,
+            feedback_id: r.get(1).map_err(err)?,
+            target: unjson(&target)?,
+            source: unjson(&json(&source)?)?,
+            verdict: unjson(&json(&verdict)?)?,
+            note: r.get(5).map_err(err)?,
+            author: r.get(6).map_err(err)?,
+            ts: r.get::<_, i64>(7).map_err(err)? as u64,
+            detail: unjson(&detail)?,
+        })
+    })())
+}
+
+fn enum_str<T: Serialize>(v: &T) -> Result<String> {
+    match serde_json::to_value(v) {
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        _ => Err(Error::Storage("enum did not serialize to a string".into())),
+    }
 }
 
 fn insert_run(c: &Connection, run: &Run) -> Result<usize> {
@@ -384,6 +437,59 @@ impl Store for SqliteStore {
         let mut stmt = conn.prepare(&sql).map_err(err)?;
         let rows = stmt.query_map([run_id], audit_from).map_err(err)?;
         rows.map(|r| r.map_err(err)?).collect()
+    }
+
+    /// FBK-2: one IMMEDIATE transaction: dedupe on `feedback_id`, else take the next seq.
+    fn append_feedback(&self, fb: &Feedback) -> Result<Feedback> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
+        let sql = format!("SELECT {FEEDBACK_COLS} FROM feedback WHERE feedback_id = ?1");
+        if let Some(r) = tx.query_row(&sql, [&fb.feedback_id], feedback_from).optional().map_err(err)? {
+            return r;
+        }
+        let seq: i64 = tx
+            .query_row("SELECT COALESCE(MAX(seq) + 1, 0) FROM feedback", [], |r| r.get(0))
+            .map_err(err)?;
+        let (kind, id) = target_key(&fb.target);
+        tx.execute(
+            "INSERT INTO feedback (seq, feedback_id, target, target_kind, target_id, source, verdict, \
+             note, author, ts, detail) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                seq, fb.feedback_id, json(&fb.target)?, kind, id, enum_str(&fb.source)?,
+                enum_str(&fb.verdict)?, fb.note, fb.author, fb.ts as i64, json(&fb.detail)?
+            ],
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(Feedback { seq: seq as u64, ..fb.clone() })
+    }
+
+    fn read_feedback(&self, from_seq: u64) -> Result<Vec<Feedback>> {
+        let conn = self.lock();
+        let sql = format!("SELECT {FEEDBACK_COLS} FROM feedback WHERE seq >= ?1 ORDER BY seq");
+        let mut stmt = conn.prepare_cached(&sql).map_err(err)?;
+        let rows = stmt.query_map([from_seq.min(i64::MAX as u64) as i64], feedback_from).map_err(err)?;
+        rows.map(|r| r.map_err(err)?).collect()
+    }
+
+    fn get_cursor(&self, name: &str) -> Result<Option<u64>> {
+        let v: Option<i64> = self
+            .lock()
+            .query_row("SELECT value FROM cursors WHERE name = ?1", [name], |r| r.get(0))
+            .optional()
+            .map_err(err)?;
+        Ok(v.map(|v| v as u64))
+    }
+
+    fn set_cursor(&self, name: &str, value: u64) -> Result<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO cursors (name, value) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                params![name, value as i64],
+            )
+            .map(|_| ())
+            .map_err(err)
     }
 }
 
@@ -676,6 +782,97 @@ mod tests {
         assert!(s.append_audit(&arec("r1", "k")).is_ok());
         let v: i64 = s.lock().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+
+    fn fb(id: &str, target: FeedbackTarget) -> Feedback {
+        Feedback {
+            seq: 99, feedback_id: id.into(), target, source: sf_core::FeedbackSource::Human,
+            verdict: sf_core::FeedbackVerdict::Helped, note: Some("n".into()), author: "alice".into(),
+            ts: 5, detail: json!({"k": 1}),
+        }
+    }
+
+    fn entry(e: &str) -> FeedbackTarget {
+        FeedbackTarget::Entry { entry_id: e.into() }
+    }
+
+    #[test]
+    fn feedback_assigns_seq_from_zero_and_dedupes() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let a = s.append_feedback(&fb("a", entry("e1"))).unwrap();
+        let b = s.append_feedback(&fb("b", FeedbackTarget::Step { run_id: "r".into(), step_id: "s".into() })).unwrap();
+        assert_eq!((a.seq, b.seq), (0, 1));
+        let mut again = fb("a", entry("other"));
+        again.verdict = sf_core::FeedbackVerdict::Wrong;
+        assert_eq!(s.append_feedback(&again).unwrap(), a);
+        let all = s.read_feedback(0).unwrap();
+        assert_eq!(all, vec![a, b.clone()]);
+        assert_eq!(s.read_feedback(1).unwrap(), vec![b]);
+        assert!(s.read_feedback(2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn feedback_is_append_only_and_cursors_roundtrip() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.append_feedback(&fb("a", entry("e1"))).unwrap();
+        assert!(s.lock().execute("UPDATE feedback SET note = 'x'", []).is_err());
+        assert!(s.lock().execute("DELETE FROM feedback", []).is_err());
+        assert_eq!(s.get_cursor("feedback-sync").unwrap(), None);
+        s.set_cursor("feedback-sync", 4).unwrap();
+        s.set_cursor("feedback-sync", 7).unwrap();
+        assert_eq!(s.get_cursor("feedback-sync").unwrap(), Some(7));
+        assert_eq!(s.get_cursor("other").unwrap(), None);
+    }
+
+    #[test]
+    fn feedback_concurrent_appends_get_distinct_seqs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sf.db");
+        SqliteStore::open(&path).unwrap();
+        let hs: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let s = SqliteStore::open(&path).unwrap();
+                    for i in 0..10 {
+                        // Ids wrap mod 50, so threads collide, so dedupe is exercised too.
+                        s.append_feedback(&fb(&format!("f{}", (t * 10 + i) % 50), entry("e"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let all = SqliteStore::open(&path).unwrap().read_feedback(0).unwrap();
+        assert_eq!(all.len(), 50);
+        assert!(all.iter().enumerate().all(|(i, f)| f.seq == i as u64));
+    }
+
+    #[test]
+    fn feedback_survives_reopen_and_v2_db_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sf.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(MIGRATIONS[0]).unwrap();
+            c.execute_batch(MIGRATIONS[1]).unwrap();
+            c.pragma_update(None, "user_version", 2).unwrap();
+            run_insert_for_test(&c);
+        }
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert_eq!(s.read_run("r1").unwrap().len(), 1);
+            s.append_feedback(&fb("a", FeedbackTarget::Template { section: "hdr".into() })).unwrap();
+            s.set_cursor("c", 1).unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let all = s.read_feedback(0).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].detail, json!({"k": 1}));
+        assert_eq!(s.get_cursor("c").unwrap(), Some(1));
+        let v: i64 = s.lock().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 3);
     }
 
     fn run_insert_for_test(c: &Connection) {

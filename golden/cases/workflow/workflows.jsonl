@@ -1,0 +1,2 @@
+{"workflow": "ship", "effect_env": "SF_SHIP_EFFECT_FILE", "gated": ["merge_protected", "deploy", "external_message", "new_capability"], "effects": {"draft_pr": 1, "merge_protected": 1, "deploy": 1, "external_message": 1, "new_capability": 1}}
+{"workflow": "demo", "effect_env": "SF_DEMO_SIDE_EFFECT_FILE", "gated": [], "approval_steps": 1, "effects": {"side-effect": 1}}

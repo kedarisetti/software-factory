@@ -1,0 +1,17 @@
+[package]
+name = "sf-eval"
+version = "0.0.0"
+edition.workspace = true
+description = "Golden-set runner and regression gate (ENT-1, RET-6): retrieval ladder, injection scanner, workflow gates."
+
+[[bin]]
+name = "sf-eval"
+path = "src/main.rs"
+
+[dependencies]
+sf-core.workspace = true
+sf-kb.workspace = true
+sf-retrieval-tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,18 @@
+Seeded regression (ENT-1): disable the remote-exec injection rule in the scanner.
+Expected: scanner detection rate falls below 1.0.
+--- a/crates/core/src/untrusted.rs	2026-10-31 15:47:08.859385371 -0400
++++ b/crates/core/src/untrusted.rs	2026-10-31 15:47:15.962499857 -0400
+@@ -85,12 +85,11 @@
+ 
+ type Rule = fn(&Norm) -> Option<String>;
+ 
+-const RULES: [(&str, Rule); 6] = [
++const RULES: [(&str, Rule); 5] = [
+     ("override-instructions", override_instructions),
+     ("role-switch", role_switch),
+     ("self-approve", self_approve),
+     ("exfiltrate-secret", exfiltrate_secret),
+-    ("remote-exec", remote_exec),
+     ("deploy-request", deploy_request),
+ ];
+ 

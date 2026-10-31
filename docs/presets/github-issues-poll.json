@@ -1,0 +1,27 @@
+{
+  "name": "gh-issues",
+  "kind": "command",
+  "command": ["gh", "api", "--method", "GET", "repos/kedarisetti/software-factory/issues?state=open&sort=updated&direction=asc&per_page=100&since={cursor}"],
+  "env": { "GH_TOKEN": "${SF_GH_TOKEN}" },
+  "poll_interval_s": 300,
+  "timeout_ms": 30000,
+  "chat": false,
+  "cursor": "max:updated_at",
+  "cursor_start": "1970-01-01T00:00:00Z",
+  "events": {
+    "items": "",
+    "ignore": [{ "/pull_request": { "exists": true } }],
+    "map": {
+      "id": "kedarisetti/software-factory#{/number}",
+      "title": "/title",
+      "text": "/body",
+      "actor": "/user/login",
+      "channel": "kedarisetti/software-factory",
+      "labels": "/labels",
+      "url": "/html_url",
+      "updated_at": "/updated_at",
+      "dedupe": "{/number}"
+    },
+    "workflow": [{ "label_prefix": { "prefix": "factory:" } }]
+  }
+}

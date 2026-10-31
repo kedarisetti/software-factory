@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row, Transactio
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sf_core::{
-    AuditRecord, Commit, Decision, Error, Event, Feedback, FeedbackTarget, Result, Run, RunState, Step, Store,
+    AuditRecord, Commit, Decision, Error, Event, Feedback, FeedbackTarget, ItemStatus, Queue, Result, Run, RunState, Step, Store, Timestamp, WorkItem,
 };
 
 /// Migrations, applied in order; `PRAGMA user_version` records how many have run.
@@ -65,6 +65,15 @@ BEGIN SELECT RAISE(ABORT, 'feedback is append-only'); END;
 CREATE TRIGGER feedback_no_delete BEFORE DELETE ON feedback
 BEGIN SELECT RAISE(ABORT, 'feedback is append-only'); END;
 CREATE TABLE cursors (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+", "
+CREATE TABLE work_items (
+    item_id TEXT PRIMARY KEY, dedupe_key TEXT UNIQUE NOT NULL, source TEXT NOT NULL,
+    source_ref TEXT NOT NULL, actor TEXT NOT NULL, channel TEXT NOT NULL, workflow TEXT,
+    priority INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT, run_id TEXT,
+    payload TEXT NOT NULL, received_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX work_items_status ON work_items(status, priority DESC, received_at);
+CREATE INDEX work_items_actor ON work_items(source, actor, received_at);
 "];
 
 /// Durable [`Store`] on a local SQLite file.
@@ -216,6 +225,31 @@ fn enum_str<T: Serialize>(v: &T) -> Result<String> {
         Ok(serde_json::Value::String(s)) => Ok(s),
         _ => Err(Error::Storage("enum did not serialize to a string".into())),
     }
+}
+
+const ITEM_COLS: &str = "item_id, source, source_ref, dedupe_key, actor, channel, workflow, priority, \
+    status, reason, run_id, payload, received_at, updated_at";
+
+fn item_from(r: &Row) -> rusqlite::Result<Result<WorkItem>> {
+    let (status, payload): (String, String) = (r.get(8)?, r.get(11)?);
+    Ok((|| {
+        Ok(WorkItem {
+            item_id: r.get(0).map_err(err)?,
+            source: r.get(1).map_err(err)?,
+            source_ref: r.get(2).map_err(err)?,
+            dedupe_key: r.get(3).map_err(err)?,
+            actor: r.get(4).map_err(err)?,
+            channel: r.get(5).map_err(err)?,
+            workflow: r.get(6).map_err(err)?,
+            priority: r.get(7).map_err(err)?,
+            status: unjson(&json(&status)?)?,
+            reason: r.get(9).map_err(err)?,
+            run_id: r.get(10).map_err(err)?,
+            payload: unjson(&payload)?,
+            received_at: r.get::<_, i64>(12).map_err(err)? as u64,
+            updated_at: r.get::<_, i64>(13).map_err(err)? as u64,
+        })
+    })())
 }
 
 fn insert_run(c: &Connection, run: &Run) -> Result<usize> {
@@ -490,6 +524,82 @@ impl Store for SqliteStore {
             )
             .map(|_| ())
             .map_err(err)
+    }
+}
+
+impl Queue for SqliteStore {
+    /// TRG-2: one IMMEDIATE transaction: a `dedupe_key` hit returns the stored item unchanged.
+    fn enqueue(&self, item: &WorkItem) -> Result<(WorkItem, bool)> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
+        let sql = format!("SELECT {ITEM_COLS} FROM work_items WHERE dedupe_key = ?1");
+        if let Some(r) = tx.query_row(&sql, [&item.dedupe_key], item_from).optional().map_err(err)? {
+            return Ok((r?, false));
+        }
+        tx.execute(
+            &format!("INSERT INTO work_items ({ITEM_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
+            params![
+                item.item_id, item.source, item.source_ref, item.dedupe_key, item.actor, item.channel,
+                item.workflow, item.priority, enum_str(&item.status)?, item.reason, item.run_id,
+                json(&item.payload)?, item.received_at as i64, item.updated_at as i64
+            ],
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok((item.clone(), true))
+    }
+
+    fn get_item(&self, item_id: &str) -> Result<Option<WorkItem>> {
+        let sql = format!("SELECT {ITEM_COLS} FROM work_items WHERE item_id = ?1");
+        self.lock().query_row(&sql, [item_id], item_from).optional().map_err(err)?.transpose()
+    }
+
+    fn list_items(&self, statuses: &[ItemStatus], limit: usize) -> Result<Vec<WorkItem>> {
+        if statuses.is_empty() {
+            return Ok(vec![]);
+        }
+        let wanted = statuses.iter().map(enum_str).collect::<Result<Vec<_>>>()?;
+        let marks = vec!["?"; wanted.len()].join(",");
+        let sql = format!(
+            "SELECT {ITEM_COLS} FROM work_items WHERE status IN ({marks}) \
+             ORDER BY priority DESC, received_at, item_id LIMIT {}",
+            limit.min(i64::MAX as usize)
+        );
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(&sql).map_err(err)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(wanted), item_from).map_err(err)?;
+        rows.map(|r| r.map_err(err)?).collect()
+    }
+
+    fn update_item(&self, item: &WorkItem) -> Result<()> {
+        let n = self
+            .lock()
+            .execute(
+                "UPDATE work_items SET status=?2, reason=?3, run_id=?4, workflow=?5, priority=?6, \
+                 updated_at=?7 WHERE item_id=?1",
+                params![
+                    item.item_id, enum_str(&item.status)?, item.reason, item.run_id, item.workflow,
+                    item.priority, item.updated_at as i64
+                ],
+            )
+            .map_err(err)?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("item {}", item.item_id)));
+        }
+        Ok(())
+    }
+
+    fn count_items_since(&self, source: &str, actor: Option<&str>, since: Timestamp) -> Result<u64> {
+        let n: i64 = self
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM work_items WHERE source = ?1 AND (?2 IS NULL OR actor = ?2) \
+                 AND received_at >= ?3",
+                params![source, actor, since.min(i64::MAX as u64) as i64],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        Ok(n as u64)
     }
 }
 
@@ -872,7 +982,7 @@ mod tests {
         assert_eq!(all[0].detail, json!({"k": 1}));
         assert_eq!(s.get_cursor("c").unwrap(), Some(1));
         let v: i64 = s.lock().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
     }
 
     fn run_insert_for_test(c: &Connection) {
@@ -882,5 +992,94 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    fn item(id: &str, key: &str, priority: i32, at: u64) -> WorkItem {
+        WorkItem {
+            item_id: id.into(), source: "slack".into(), source_ref: "C1/1.0".into(),
+            dedupe_key: key.into(), actor: "U1".into(), channel: "C1".into(), workflow: None,
+            priority, status: ItemStatus::Queued, reason: None, run_id: None,
+            payload: json!({"text": "hi"}), received_at: at, updated_at: at,
+        }
+    }
+
+    #[test]
+    fn queue_dedupes_on_key() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let (a, fresh) = s.enqueue(&item("i1", "k", 0, 10)).unwrap();
+        assert!(fresh);
+        let (b, fresh) = s.enqueue(&item("i2", "k", 5, 20)).unwrap();
+        assert!(!fresh);
+        assert_eq!(a, b);
+        assert!(s.get_item("i2").unwrap().is_none());
+        assert_eq!(s.get_item("i1").unwrap(), Some(a));
+    }
+
+    #[test]
+    fn queue_dedupe_under_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(SqliteStore::open(dir.path().join("sf.db")).unwrap());
+        let hs: Vec<_> = (0..8)
+            .map(|n| {
+                let s = s.clone();
+                std::thread::spawn(move || s.enqueue(&item(&format!("i{n}"), "same", 0, n)).unwrap().1)
+            })
+            .collect();
+        let fresh = hs.into_iter().map(|h| h.join().unwrap()).filter(|f| *f).count();
+        assert_eq!(fresh, 1);
+        assert_eq!(s.list_items(&[ItemStatus::Queued], 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queue_orders_by_priority_then_age() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        for (id, p, at) in [("a", 0, 1), ("b", 5, 3), ("c", 5, 2), ("d", 0, 0)] {
+            s.enqueue(&item(id, id, p, at)).unwrap();
+        }
+        let ids = |v: Vec<WorkItem>| v.into_iter().map(|i| i.item_id).collect::<Vec<_>>();
+        assert_eq!(ids(s.list_items(&[ItemStatus::Queued], 10).unwrap()), ["c", "b", "d", "a"]);
+        assert_eq!(ids(s.list_items(&[ItemStatus::Queued], 2).unwrap()), ["c", "b"]);
+        assert!(s.list_items(&[], 10).unwrap().is_empty());
+        assert!(s.list_items(&[ItemStatus::Done], 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn queue_update_and_count() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.enqueue(&item("a", "a", 0, 10)).unwrap();
+        let mut other = item("b", "b", 0, 20);
+        other.actor = "U2".into();
+        s.enqueue(&other).unwrap();
+        assert_eq!(s.count_items_since("slack", None, 0).unwrap(), 2);
+        assert_eq!(s.count_items_since("slack", Some("U1"), 0).unwrap(), 1);
+        assert_eq!(s.count_items_since("slack", None, 15).unwrap(), 1);
+        assert_eq!(s.count_items_since("github", None, 0).unwrap(), 0);
+        let mut a = s.get_item("a").unwrap().unwrap();
+        a.status = ItemStatus::Started;
+        a.run_id = Some("run-1".into());
+        a.workflow = Some("wf".into());
+        a.updated_at = 30;
+        s.update_item(&a).unwrap();
+        assert_eq!(s.get_item("a").unwrap(), Some(a));
+        assert_eq!(s.list_items(&[ItemStatus::Queued], 10).unwrap().len(), 1);
+        let ghost = item("ghost", "g", 0, 1);
+        assert!(matches!(s.update_item(&ghost), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn queue_migrates_from_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sf.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..3] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", 3).unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let v: i64 = s.lock().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len());
+        assert!(s.enqueue(&item("a", "a", 0, 1)).unwrap().1);
     }
 }

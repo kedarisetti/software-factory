@@ -9,9 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 sf-core.workspace = true
+serde.workspace = true
 sf-orchestrator.workspace = true
 sf-store-sqlite.workspace = true
 sf-sandbox-local.workspace = true
+sf-intake.workspace = true
 sf-kb.workspace = true
 sf-retrieval-tantivy.workspace = true
 serde_json.workspace = true

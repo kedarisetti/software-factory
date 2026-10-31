@@ -1,11 +1,14 @@
 //! In-memory `Store` test double with the same contract as the SQLite store: atomic commit,
-//! duplicate-seq `Conflict`, write-once effect ledger and inbox, hash-chained audit log deduped by key.
+//! duplicate-seq `Conflict`, write-once effect ledger and inbox, hash-chained audit log deduped by key,
+//! and a work queue deduped by `dedupe_key`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use sf_core::{AuditRecord, Feedback, Commit, Error, Event, Result, Run, RunState, Step, Store};
+use sf_core::{
+    AuditRecord, Commit, Error, Event, Feedback, ItemStatus, Queue, Result, Run, RunState, Step, Store, Timestamp, WorkItem,
+};
 
 #[derive(Default)]
 struct Inner {
@@ -17,6 +20,7 @@ struct Inner {
     audit: Vec<AuditRecord>,
     feedback: Vec<Feedback>,
     cursors: HashMap<String, u64>,
+    items: Vec<WorkItem>,
 }
 
 #[derive(Default)]
@@ -145,5 +149,51 @@ impl Store for MemoryStore {
     fn set_cursor(&self, name: &str, value: u64) -> Result<()> {
         self.0.lock().unwrap().cursors.insert(name.into(), value);
         Ok(())
+    }
+}
+
+impl Queue for MemoryStore {
+    fn enqueue(&self, item: &WorkItem) -> Result<(WorkItem, bool)> {
+        let mut g = self.0.lock().unwrap();
+        if let Some(i) = g.items.iter().find(|i| i.dedupe_key == item.dedupe_key) {
+            return Ok((i.clone(), false));
+        }
+        if g.items.iter().any(|i| i.item_id == item.item_id) {
+            return Err(Error::Conflict(format!("item {}", item.item_id)));
+        }
+        g.items.push(item.clone());
+        Ok((item.clone(), true))
+    }
+
+    fn get_item(&self, item_id: &str) -> Result<Option<WorkItem>> {
+        Ok(self.0.lock().unwrap().items.iter().find(|i| i.item_id == item_id).cloned())
+    }
+
+    fn list_items(&self, statuses: &[ItemStatus], limit: usize) -> Result<Vec<WorkItem>> {
+        let g = self.0.lock().unwrap();
+        let mut v: Vec<WorkItem> = g.items.iter().filter(|i| statuses.contains(&i.status)).cloned().collect();
+        v.sort_by(|a, b| (std::cmp::Reverse(a.priority), a.received_at, &a.item_id).cmp(&(std::cmp::Reverse(b.priority), b.received_at, &b.item_id)));
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    fn update_item(&self, item: &WorkItem) -> Result<()> {
+        let mut g = self.0.lock().unwrap();
+        let Some(i) = g.items.iter_mut().find(|i| i.item_id == item.item_id) else {
+            return Err(Error::NotFound(format!("item {}", item.item_id)));
+        };
+        i.status = item.status;
+        i.reason = item.reason.clone();
+        i.run_id = item.run_id.clone();
+        i.workflow = item.workflow.clone();
+        i.priority = item.priority;
+        i.updated_at = item.updated_at;
+        Ok(())
+    }
+
+    fn count_items_since(&self, source: &str, actor: Option<&str>, since: Timestamp) -> Result<u64> {
+        let g = self.0.lock().unwrap();
+        let n = g.items.iter().filter(|i| i.source == source && actor.is_none_or(|a| i.actor == a) && i.received_at >= since).count();
+        Ok(n as u64)
     }
 }

@@ -1,0 +1,1 @@
+{"action":"labeled","issue":{"number":44,"title":"x","user":{"login":"hubot"},"labels":[{"name":"docs"},{"name":"factory:docs-fix"}],"body":"y"},"label":{"name":"docs"},"repository":{"full_name":"acme/shop"},"sender":{"login":"maintainer"}}

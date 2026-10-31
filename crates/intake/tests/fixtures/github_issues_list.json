@@ -1,0 +1,5 @@
+[
+ {"number":42,"title":"Checkout total wrong with coupon","user":{"login":"octocat"},"labels":[{"name":"factory:fix-bug"},{"name":"urgent"}],"state":"open","body":"Applying a 10% coupon doubles the shipping."},
+ {"number":45,"title":"Bump deps","user":{"login":"dependabot[bot]"},"labels":[{"name":"factory:fix-bug"}],"pull_request":{"url":"https://api.github.com/repos/acme/shop/pulls/45"},"body":""},
+ {"number":46,"title":"Question about pricing","user":{"login":"someone"},"labels":[{"name":"question"}],"body":"?"}
+]

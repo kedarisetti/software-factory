@@ -1,0 +1,27 @@
+{
+  "name": "linear",
+  "kind": "mcp",
+  "command": ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"],
+  "env": { "LINEAR_API_KEY": "${SF_LINEAR_API_KEY}" },
+  "tool": "list_issues",
+  "arguments": { "updatedAt": "{cursor}", "limit": 50 },
+  "poll_interval_s": 300,
+  "timeout_ms": 30000,
+  "chat": false,
+  "cursor": "max:updated_at",
+  "cursor_start": null,
+  "events": {
+    "items": "/issues",
+    "map": {
+      "id": "/identifier",
+      "title": "/title",
+      "text": "/description",
+      "actor": "/creator/name",
+      "channel": "/team/key",
+      "labels": "/labels",
+      "url": "/url",
+      "updated_at": "/updatedAt"
+    },
+    "workflow": [{ "default": "triage" }]
+  }
+}

@@ -227,7 +227,7 @@ pub mod tests {
         }
         fn check_anchors(&self, _: &Caller) -> Result<AnchorReport> {
             self.log("check_anchors", String::new());
-            Ok(AnchorReport { checked: 3, broken: vec![], repaired: vec![], dangling_links: vec![] })
+            Ok(AnchorReport { checked: 3, broken: vec![], repaired: vec![], dangling_links: vec![], unreadable: vec![], stale_pages: vec![] })
         }
     }
 

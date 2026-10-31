@@ -495,7 +495,7 @@ impl Kb {
     fn do_check_anchors(&self, caller: &Caller) -> Result<AnchorReport> {
         let _lock = self.lock()?;
         let now = (self.now)();
-        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![], dangling_links: vec![] };
+        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![], dangling_links: vec![], unreadable: vec![], stale_pages: vec![] };
         let entries = self.load_all()?;
         let ids: HashSet<&str> = entries.iter().map(|e| e.meta.id.as_str()).collect();
         for e in &entries {

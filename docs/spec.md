@@ -94,7 +94,7 @@ Each requirement has an ID so tests, tickets and feedback can point at it. "Must
 - **RET-2 (must):** Expired entries (KNO-4) and entries with broken anchors (KNO-2) are filtered out before ranking.
 - **RET-3 (must):** Each subagent queries with its task-class filter and a per-class top-k, so it gets only the context its class needs (ENT-3).
 - **RET-4 (must):** Every retrieval is logged as an event (query, returned entry IDs, scores). Replay sees the same context, and feedback can name the entry that helped or misled.
-- **RET-5 (should):** The index updates on every knowledge write and rebuilds nightly with the anchor check.
+- **RET-5 (should):** The index updates on every knowledge write and rebuilds nightly with the anchor check. Entry files edited by hand (WIKI) are picked up before the next search: when any entry file is newer than the index, the changed entries are re-indexed first.
 - **RET-6 (should):** Retrieval quality is measured on the golden set as recall@k of entries a human marked relevant. BM25 parameters (k1, b) and field weights are tuned against it. Evaluation follows [1]: a nested ladder of growing store sizes with the questions and relevant entries fixed, reporting accuracy, tool calls and tokens per question at each size, so a change that helps small stores but hurts large ones is visible.
 - **RET-7 (must):** Agents retrieve with search-then-navigate, the Agent+BM25 pattern from [1]. The first `search` uses the task's original wording, unchanged. Later searches may reformulate. The agent then reads (`get`) or browses (`list`) only the narrowed candidates. Tool descriptions in every front door say this. In [1] this beat both plain BM25 and file-browsing agents at every scale, at about a sixth of the calls of file browsing.
 
@@ -129,7 +129,9 @@ The store doubles as a wiki that humans and agents navigate the same way: open `
 - **WIKI-4 (must):** Typed links are also written as `[[wikilinks]]` in a generated footer below the body, so Markdown tools (Obsidian, GitHub) can show the graph and backlinks. The body above the footer is never rewritten.
 - **WIKI-5 (should):** Synthesis pages (kind `page`) summarise a topic across entries, with `derived-from` links to their sources. Agents write them one at a time with `add`, when a topic has enough entries to be worth a summary. There is no batch build.
 - **WIKI-6 (should):** `AGENTS.md` at the root states the layout and conventions, so any harness can find its way without the service's docs.
-- **WIKI-7 (should):** `check_anchors` also reports dangling links: links whose target entry does not exist.
+- **WIKI-7 (should):** `check_anchors` also reports dangling links (links whose target entry does not exist) and entry files that do not parse.
+- **WIKI-8 (must):** Synthesis pages cannot outlive their sources. When an entry a page is `derived-from` expires, loses an anchor or gets `misled` or `wrong` feedback, the page becomes `stale`: listed in the wiki, but left out of search until revised. A page is revised by adding a new page with a `supersedes` link to it; adding any entry with a `supersedes` link expires the target.
+- **WIKI-9 (must):** One bad file never takes the store down. An entry file that does not parse (for example after a hand edit) is skipped by search, `list` and index generation, reported by `check_anchors`, and listed under "Needs attention" in the root `index.md`. Operations on other entries keep working.
 
 ### Triggers and intake
 
@@ -236,7 +238,7 @@ The headline metric is cost per successful task, tracked monthly: if the loops w
 
 Each milestone ships only when its exit criteria pass. Dates are not set yet.
 
-1. **Knowledge service.** KIF-1 to KIF-8, KNO-1 to KNO-4, RET-1 to RET-7, LRN-1 to LRN-4, WIKI-1 to WIKI-7. Exit: Pi (through its extension) and one MCP agent (Claude Code) both search and write learnings to the same store; every call is logged with its agent; the anchor check runs. Useful on its own before the orchestrator exists.
+1. **Knowledge service.** KIF-1 to KIF-8, KNO-1 to KNO-4, RET-1 to RET-7, LRN-1 to LRN-4, WIKI-1 to WIKI-9. Exit: Pi (through its extension) and one MCP agent (Claude Code) both search and write learnings to the same store; every call is logged with its agent; the anchor check runs. Useful on its own before the orchestrator exists.
 2. **Durable core.** DUR-1 to DUR-6, SBX-4. Exit: a run survives a forced crash and a deploy mid-run; a retried step creates no duplicate side effect; cost baseline recorded.
 3. **Safe execution.** SBX-1 to SBX-3, approval gates, audit log. Exit: an injection test suite passes; every gated action parks and resumes on approval.
 4. **Verification loop.** FBK-1 to FBK-3, ENT-1. Exit: golden set runs in CI and blocks a seeded regression.

@@ -107,6 +107,8 @@ pub enum EntryStatus {
     Expired,
     /// At least one anchor no longer resolves (KNO-2).
     BrokenAnchor,
+    /// Synthesis page whose `derived-from` source expired, broke or was flagged (WIKI-8).
+    Stale,
 }
 
 /// Run outcome a learning came from (LRN-4).
@@ -263,6 +265,19 @@ pub struct AnchorReport {
     /// Links whose target does not exist (WIKI-7).
     #[serde(default)]
     pub dangling_links: Vec<DanglingLink>,
+    /// Entry files that do not parse, skipped everywhere else (WIKI-9).
+    #[serde(default)]
+    pub unreadable: Vec<Unreadable>,
+    /// Pages marked `Stale` by this check (WIKI-8).
+    #[serde(default)]
+    pub stale_pages: Vec<EntryId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Unreadable {
+    /// Path relative to the root.
+    pub path: String,
+    pub reason: String,
 }
 
 /// One folder of the wiki, as returned by `list` (WIKI-2, RET-7).
@@ -344,7 +359,8 @@ pub trait Knowledge {
     /// FBK-2 for knowledge entries: bumps tallies; `Wrong` or `Stale` expires the entry.
     fn feedback(&self, caller: &Caller, id: &str, verdict: Verdict, note: Option<&str>) -> Result<Entry>;
     /// KNO-2: verify every anchor; mark broken ones `BrokenAnchor`, restore repaired ones to `Active`.
-    /// Also reports dangling links (WIKI-7).
+    /// Also reports dangling links and unreadable files (WIKI-7, WIKI-9), marks pages stale (WIKI-8),
+    /// and rebuilds the index and wiki files (RET-5).
     fn check_anchors(&self, caller: &Caller) -> Result<AnchorReport>;
 }
 

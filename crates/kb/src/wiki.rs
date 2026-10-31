@@ -111,6 +111,7 @@ fn entry_line(e: &Entry, href: &str) -> String {
         EntryStatus::Active => {}
         EntryStatus::Expired => line.push_str(" · expired"),
         EntryStatus::BrokenAnchor => line.push_str(" · broken-anchor"),
+        EntryStatus::Stale => line.push_str(" · stale"),
     }
     if m.count > 1 {
         line.push_str(&format!(" · ×{}", m.count));

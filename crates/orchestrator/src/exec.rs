@@ -1,6 +1,6 @@
 //! Sandboxed tool execution with credential injection, redaction and audit (SBX-1, SBX-2).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use sf_core::{
@@ -18,6 +18,8 @@ pub(crate) struct ToolRun {
     pub audit: Auditor,
     pub scopes: Vec<String>,
     pub ttl_ms: u64,
+    /// Set when a secret request is refused by policy; the step then escalates at once, no retry.
+    pub blocked: Arc<Mutex<Option<String>>>,
 }
 
 /// The engine owns the workspace name: the run id with anything outside `[A-Za-z0-9._-]` replaced.
@@ -63,6 +65,7 @@ impl ToolRun {
 
     fn block<T>(&self, key: &str, s: &SecretRef, why: &str) -> Result<T> {
         let detail = json!({"env": s.env, "reason": why});
+        *self.blocked.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("secret {}: {why}", s.scope));
         self.audit.record(format!("{key}:secret:{}:{}:blocked", s.scope, s.env), "secret", &s.scope, "", Decision::Blocked, None, detail)?;
         Err(Error::Forbidden(format!("secret {}: {why}", s.scope)))
     }

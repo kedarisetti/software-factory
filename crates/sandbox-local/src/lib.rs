@@ -4,13 +4,15 @@
 //! call's own workspace (`<root>/ws/<workspace>`, also `HOME`) are visible, in fresh pid, ipc, uts,
 //! user and net namespaces. With empty `egress` there is no network; otherwise traffic goes only
 //! through a per-call allowlist proxy (Unix socket bridged by `sf-netshim`), and every attempt is
-//! returned in `ToolOutput.egress`. If `bwrap` or the shim is unavailable, `run` fails closed with
+//! returned in `ToolOutput.egress`. The shim is any binary that serves `netshim::main` when its file name
+//! is `sf-netshim` (the sandbox binds it at `/run/sf-netshim`; `sf` does this). If `bwrap` or the shim is unavailable, `run` fails closed with
 //! `Error::Forbidden`. `LocalSandbox::unconfined` skips isolation, does NOT meet SBX-1 and refuses
 //! any call with egress rules.
 //!
 //! Also enforced: a scrubbed environment with no inherited parent secrets (SBX-2), and wall-clock,
 //! output-size and kill-switch limits that kill the child's whole process group (SBX-4).
 
+pub mod netshim;
 mod proxy;
 
 use std::io::{Read, Write};

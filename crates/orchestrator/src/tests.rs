@@ -583,19 +583,21 @@ fn secret_is_injected_redacted_and_never_stored() {
 fn unknown_scope_is_forbidden_and_audited() {
     let mut env = Env::new();
     env.creds = Some(Arc::new(StaticCredentials::new(env.clock.clone(), 60_000).secret("gh:write", "v")));
-    env.reg.register(StaticWorkflow::new("wf", 1, vec![tool_step(secret_call(), Arc::default()).retries(1, 1, 1)])); // default policy: no scopes
+    env.reg.register(StaticWorkflow::new("wf", 1, vec![tool_step(secret_call(), Arc::default())])); // default policy: no scopes
     let e = env.engine();
     let id = e.start_run("wf", "t", 0, 0).unwrap();
-    assert_eq!(e.tick(&id).unwrap(), RunState::Escalated);
+    assert_eq!(e.tick(&id).unwrap(), RunState::Escalated); // at once: default 3 attempts, no retry
+    assert_eq!(env.store.get_steps(&id).unwrap()[0].attempt, 1);
     assert_eq!(env.sandbox.runs.load(Ordering::SeqCst), 0);
     let log = env.audit();
     assert!(log.iter().any(|r| r.action == "secret" && r.decision == Decision::Blocked && r.target == "gh:write"));
     // A scope the policy grants but the issuer does not know is also forbidden.
     let env2 = Env { creds: Some(Arc::new(StaticCredentials::new(env.clock.clone(), 1))), ..Env::new() };
-    let wf = StaticWorkflow::new("wf", 1, vec![tool_step(secret_call(), Arc::default()).retries(1, 1, 1)]);
+    let wf = StaticWorkflow::new("wf", 1, vec![tool_step(secret_call(), Arc::default())]);
     env2.reg.register(wf.with_policy(Policy::default().scopes(&["gh:write"])));
     let id = env2.engine().start_run("wf", "t", 0, 0).unwrap();
     assert_eq!(env2.engine().tick(&id).unwrap(), RunState::Escalated);
+    assert_eq!(env2.store.get_steps(&id).unwrap()[0].attempt, 1);
     assert!(env2.audit().iter().any(|r| r.decision == Decision::Blocked));
 }
 
@@ -609,11 +611,12 @@ fn expired_lease_is_rejected() {
     }
     let mut env = Env::new();
     env.creds = Some(Arc::new(Stale));
-    let wf = StaticWorkflow::new("wf", 1, vec![tool_step(secret_call(), Arc::default()).retries(1, 1, 1)]);
+    let wf = StaticWorkflow::new("wf", 1, vec![tool_step(secret_call(), Arc::default())]);
     env.reg.register(wf.with_policy(Policy::default().scopes(&["gh:write"])));
     let e = env.engine();
     let id = e.start_run("wf", "t", 0, 0).unwrap();
-    assert_eq!(e.tick(&id).unwrap(), RunState::Escalated);
+    assert_eq!(e.tick(&id).unwrap(), RunState::Escalated); // at once: default 3 attempts, no retry
+    assert_eq!(env.store.get_steps(&id).unwrap()[0].attempt, 1);
     assert_eq!(env.sandbox.runs.load(Ordering::SeqCst), 0);
     assert!(env.audit().iter().any(|r| r.decision == Decision::Blocked && r.detail["reason"] == "lease expired"));
     assert!(!dump(&env, &id).contains("old-secret"));

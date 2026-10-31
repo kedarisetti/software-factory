@@ -60,7 +60,7 @@ fn sigkill_mid_run_resumes_without_duplicate() {
     child.wait().unwrap();
     json(&e, &["run"]);
     assert_eq!(state(&e, &id), "AwaitingApproval");
-    json(&e, &["approve", &id]);
+    json(&e, &["approve", &id, "--as", "alice"]);
     json(&e, &["run"]);
     assert_eq!(state(&e, &id), "Succeeded");
     assert_eq!(lines(&e.side), 1);
@@ -74,7 +74,7 @@ fn crash_between_effect_and_checkpoint_does_not_duplicate() {
     assert!(!o.status.success(), "process should have aborted");
     assert_eq!(lines(&e.side), 1);
     json(&e, &["run"]);
-    json(&e, &["approve", &id]);
+    json(&e, &["approve", &id, "--as", "alice"]);
     json(&e, &["run"]);
     assert_eq!(state(&e, &id), "Succeeded");
     assert_eq!(lines(&e.side), 1, "effect ledger must suppress the re-run");
@@ -89,7 +89,7 @@ fn crash_between_external_write_and_ledger_does_not_duplicate() {
     assert!(!o.status.success(), "process should have aborted");
     assert_eq!(lines(&e.side), 1);
     json(&e, &["run"]);
-    json(&e, &["approve", &id]);
+    json(&e, &["approve", &id, "--as", "alice"]);
     json(&e, &["run"]);
     assert_eq!(state(&e, &id), "Succeeded");
     assert_eq!(lines(&e.side), 1, "receiver must dedupe on the idempotency key");
@@ -101,7 +101,7 @@ fn deploy_mid_run_across_three_processes() {
     let id = start(&e);
     json(&e, &["run"]); // process 1: parks for approval, exits
     assert_eq!(state(&e, &id), "AwaitingApproval");
-    json(&e, &["approve", &id]); // process 2
+    json(&e, &["approve", &id, "--as", "alice"]); // process 2
     json(&e, &["run"]); // process 3
     let s = json(&e, &["status", &id]);
     assert_eq!(s["state"], "Succeeded");

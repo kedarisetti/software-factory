@@ -236,9 +236,16 @@ impl StepCtx {
             audit: self.audit.clone(),
             scopes: self.policy.scopes.clone(),
             ttl_ms: self.policy.lease_ttl_ms,
+            blocked: Arc::default(),
         };
+        let blocked = run.blocked.clone();
         let l = *limits;
-        let (v, fresh) = self.guarded(move |key| run.run(key, c, &l))?;
+        let res = self.guarded(move |key| run.run(key, c, &l));
+        // A refused secret (scope not granted, lease expired) is a policy breach: escalate, never retry.
+        if let Some(reason) = blocked.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.escalation.get_or_insert(Escalation { reason, waives: vec![] });
+        }
+        let (v, fresh) = res?;
         if fresh {
             self.tool_call(json!({"program": call.program, "args": call.args}));
             self.tool_result(v.clone());

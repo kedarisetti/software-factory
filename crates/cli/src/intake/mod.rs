@@ -1,8 +1,12 @@
-//! `sf intake ...` (TRG-1 to TRG-4): serve webhooks, poll GitHub, dispatch the queue, list, bottlenecks.
+//! `sf intake ...` (TRG-1 to TRG-4): serve webhooks, poll sources (GitHub, MCP), approve connectors,
+//! dispatch the queue, list, bottlenecks.
 
 mod config;
+mod connectors;
 mod http;
+mod mcp_client;
 mod poll;
+mod state;
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -44,23 +48,40 @@ fn config_path(args: &[String]) -> Result<String, String> {
     opt(args, "--config").ok_or_else(|| "--config <intake.json> is required".into())
 }
 
-/// `args` start at the intake subcommand (`serve`, `poll`, `dispatch`, `list`, `bottlenecks`).
-pub fn run(args: &[String], store: Arc<SqliteStore>, engine: &Engine) -> Result<Value, String> {
+/// `args` start at the intake subcommand (`serve`, `poll`, `connectors`, `dispatch`, `list`, `bottlenecks`).
+/// `db` locates the cursor state file; `approver` is the global `--as`.
+pub fn run(args: &[String], store: Arc<SqliteStore>, engine: &Engine, db: &str, approver: Option<String>) -> Result<Value, String> {
     let queue: Arc<dyn Queue> = store.clone();
     let sub = args.first().map(String::as_str).unwrap_or("");
     match sub {
         "serve" => serve(args, queue),
-        "poll" => {
-            if args.get(1).map(String::as_str) != Some("github") {
-                return Err("usage: sf intake poll github --repo <org/repo> [--label factory] [--from-file f.json] --config c".into());
-            }
+        "poll" if args.get(1).map(String::as_str) == Some("github") => {
+            // Shorthand kept from before sources were configurable: one repo, source `github`.
             let loaded = load(&config_path(args)?, queue, false)?;
             let repo = opt(args, "--repo").ok_or("--repo <org/repo> is required")?;
+            let source = opt(args, "--source").unwrap_or_else(|| "github".into());
             let issues = match opt(args, "--from-file") {
                 Some(f) => serde_json::from_str(&std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?).map_err(|e| format!("{f}: {e}"))?,
                 None => poll::fetch(&repo, &opt(args, "--label").unwrap_or_else(|| "factory".into()))?,
             };
-            poll::poll(&*store, &loaded.intake, &repo, &issues, SystemClock.now())
+            poll::poll(&*store, &loaded.intake, &source, &repo, &issues, SystemClock.now())
+        }
+        "poll" => {
+            let loaded = load(&config_path(args)?, queue, false)?;
+            let only = opt(args, "--source");
+            let force = args.iter().any(|a| a == "--now");
+            poll::poll_sources(&*store, &state::State::beside(db), &loaded, only.as_deref(), force, SystemClock.now())
+        }
+        "connectors" => {
+            let loaded = load(&config_path(args)?, queue, false)?;
+            let name = || args.get(2).filter(|n| !n.starts_with("--")).cloned().ok_or("usage: sf intake connectors approve|revoke <name> --as <human> --config c.json");
+            let who = || approver.clone().filter(|a| !a.trim().is_empty()).ok_or("--as <human> is required and must not be empty");
+            match args.get(1).map(String::as_str) {
+                Some("list") => connectors::list(&*store, &loaded),
+                Some("approve") => connectors::approve(&*store, &loaded, &name()?, &who()?),
+                Some("revoke") => connectors::revoke(&*store, &loaded, &name()?, &who()?),
+                _ => Err("usage: sf intake connectors list | approve <name> --as <human> | revoke <name> --as <human>".into()),
+            }
         }
         "dispatch" => {
             let loaded = load(&config_path(args)?, queue, false)?;
@@ -79,7 +100,7 @@ pub fn run(args: &[String], store: Arc<SqliteStore>, engine: &Engine) -> Result<
             let out = loaded.intake.run_bottlenecks(SystemClock.now(), window, num(args, "--min", 3)? as usize).map_err(|e| e.to_string())?;
             Ok(json!(out.iter().map(|o| json!({"item_id": o.item.item_id, "inserted": o.inserted, "title": o.item.payload["title"], "count": o.item.payload["count"]})).collect::<Vec<_>>()))
         }
-        other => Err(format!("unknown intake subcommand {other:?}: serve | poll | dispatch | list | bottlenecks")),
+        other => Err(format!("unknown intake subcommand {other:?}: serve | poll | connectors | dispatch | list | bottlenecks")),
     }
 }
 
@@ -132,13 +153,14 @@ fn dispatch(l: &Loaded, engine: &Engine, max: usize) -> Result<Value, String> {
     Ok(json!({"started": started, "failed": failed, "paused": paused}))
 }
 
-/// The trigger ref is `{source}:{source_ref}`; the engine uses its prefix for the chat-deploy rule.
+/// The trigger ref is `{source}:{source_ref}`, or `chat:{source}:{source_ref}` for a chat source (kind
+/// slack or `chat: true`); the engine uses the `chat` prefix for its no-chat-deploy rule.
 fn start(l: &Loaded, engine: &Engine, item: &WorkItem) -> Result<String, String> {
     let wf = item.workflow.as_deref().ok_or("item has no workflow")?;
     let input = json!({
         "item_id": item.item_id, "source": item.source, "source_ref": item.source_ref,
         "actor": item.actor, "channel": item.channel, "payload": item.payload,
     });
-    let trigger = format!("{}:{}", item.source, item.source_ref);
+    let trigger = if l.is_chat(&item.source) { format!("chat:{}:{}", item.source, item.source_ref) } else { format!("{}:{}", item.source, item.source_ref) };
     engine.start_run_with_input(wf, &trigger, l.budget.run_tokens, l.budget.run_usd_micros, input).map_err(|e| e.to_string())
 }

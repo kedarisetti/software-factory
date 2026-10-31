@@ -4,7 +4,8 @@ use serde::Deserialize;
 
 use crate::event::IntakeEvent;
 
-/// Sources whose messages are chat. They can never start a deploy workflow.
+/// Chat sources assumed when the table is parsed without a source config (`from_json`). Configured
+/// deployments pass the real set, from `kind: slack` and `chat: true` sources, to `from_json_with_chat`.
 pub const CHAT_SOURCES: &[&str] = &["slack"];
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -27,6 +28,13 @@ pub struct PermissionTable {
     /// Workflows that can deploy. No chat source may allow one.
     #[serde(default)]
     pub deploy_workflows: Vec<String>,
+    /// Source names that are chat. Not part of the JSON; set by the loader from the source config.
+    #[serde(skip, default = "default_chat")]
+    pub chat_sources: Vec<String>,
+}
+
+fn default_chat() -> Vec<String> {
+    CHAT_SOURCES.iter().map(|s| s.to_string()).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +62,14 @@ impl PermissionTable {
         Ok(t)
     }
 
+    /// Like `from_json` but chat-ness comes from the source config: exactly these names are chat.
+    pub fn from_json_with_chat(json: &str, chat_sources: &[String]) -> Result<Self, ConfigError> {
+        let mut t: PermissionTable = serde_json::from_str(json).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        t.chat_sources = chat_sources.to_vec();
+        t.validate()?;
+        Ok(t)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         for r in &self.rules {
             if r.source == "*" || r.source.is_empty() {
@@ -63,7 +79,7 @@ impl PermissionTable {
                 return Err(ConfigError::Invalid("workflow wildcards are not allowed".into()));
             }
             if let Some(w) = r.workflows.iter().find(|w| self.is_deploy(w)) {
-                if is_chat(&r.source) {
+                if self.is_chat(&r.source) {
                     return Err(ConfigError::ChatDeploy { chat_source: r.source.clone(), workflow: w.clone() });
                 }
             }
@@ -77,7 +93,7 @@ impl PermissionTable {
 
     /// Allowed only if some rule matches source, channel, actor and workflow.
     pub fn decide(&self, ev: &IntakeEvent, workflow: &str) -> Permission {
-        if is_chat(&ev.source) && self.is_deploy(workflow) {
+        if self.is_chat(&ev.source) && self.is_deploy(workflow) {
             return Permission::Rejected(format!("chat source {} cannot start deploy workflow {workflow}", ev.source));
         }
         let hit = self.rules.iter().any(|r| {
@@ -94,6 +110,8 @@ impl PermissionTable {
     }
 }
 
-fn is_chat(source: &str) -> bool {
-    CHAT_SOURCES.iter().any(|c| c.eq_ignore_ascii_case(source))
+impl PermissionTable {
+    fn is_chat(&self, source: &str) -> bool {
+        self.chat_sources.iter().any(|c| c.eq_ignore_ascii_case(source))
+    }
 }

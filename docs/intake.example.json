@@ -1,21 +1,56 @@
 {
-  "slack": {
-    "signing_secret_env": "SF_SLACK_SIGNING_SECRET",
-    "bot_user_id": "U0FACTORY",
-    "channel_defaults": { "C0FACTORY": "demo" }
-  },
-  "github": { "webhook_secret_env": "SF_GITHUB_WEBHOOK_SECRET" },
+  "version": 2,
+  "sources": [
+    {
+      "name": "slack",
+      "kind": "slack",
+      "signing_secret_env": "SF_SLACK_SIGNING_SECRET",
+      "bot_user_id": "U0FACTORY",
+      "channel_defaults": { "C0FACTORY": "demo" }
+    },
+    {
+      "name": "github",
+      "kind": "github",
+      "webhook_secret_env": "SF_GITHUB_WEBHOOK_SECRET",
+      "poll": { "repos": ["kedarisetti/software-factory"], "label": "factory", "interval_s": 300 }
+    },
+    {
+      "name": "linear",
+      "kind": "mcp",
+      "command": ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"],
+      "env": { "LINEAR_API_KEY": "${SF_LINEAR_API_KEY}" },
+      "tool": "list_issues",
+      "arguments": { "updatedAt": "{cursor}", "limit": 50 },
+      "poll_interval_s": 300,
+      "timeout_ms": 30000,
+      "chat": false,
+      "default_workflow": "triage",
+      "map": {
+        "items": "/issues",
+        "id": "/identifier",
+        "title": "/title",
+        "text": "/description",
+        "actor": "/creator/name",
+        "channel": "/team/key",
+        "labels": "/labels",
+        "url": "/url",
+        "updated_at": "/updatedAt"
+      },
+      "cursor": "max:updated_at"
+    }
+  ],
   "permissions": {
     "deploy_workflows": ["ship"],
     "rules": [
       { "source": "slack", "channel": "C0FACTORY", "workflows": ["demo", "triage"] },
-      { "source": "github", "channel": "kedarisetti/software-factory", "workflows": ["triage", "demo", "ship"] }
+      { "source": "github", "channel": "kedarisetti/software-factory", "workflows": ["triage", "demo", "ship"] },
+      { "source": "linear", "channel": "ENG", "workflows": ["triage"] }
     ]
   },
-  "rate": { "window_ms": 3600000, "per_source": { "slack": 60, "github": 60 }, "per_actor": 20 },
+  "rate": { "window_ms": 3600000, "per_source": { "slack": 60, "github": 60, "linear": 60 }, "per_actor": 20 },
   "near_dup_window_ms": 600000,
   "priority": {
-    "base": { "github": 10, "slack": 5 },
+    "base": { "github": 10, "slack": 5, "linear": 8 },
     "rules": [
       { "name": "p0", "labels": ["p0", "priority:p0"], "keywords": ["p0"], "score": 100 },
       { "name": "incident", "labels": ["incident", "sev1"], "keywords": ["incident", "outage"], "score": 80 },

@@ -6,6 +6,7 @@ pub mod connector;
 pub mod event;
 pub mod github;
 pub mod intake;
+pub mod mcp;
 pub mod permissions;
 pub mod priority;
 pub mod sig;

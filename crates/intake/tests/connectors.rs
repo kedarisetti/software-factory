@@ -12,6 +12,7 @@ const SECRET: &str = "8f742231b10e8888abcd99yyyzzz85a5";
 
 fn slack_cfg() -> SlackConfig {
     SlackConfig {
+        source: "slack".into(),
         signing_secret: SECRET.into(),
         bot_user_id: "U0LAN0Z89".into(),
         channel_defaults: BTreeMap::from([("C0DEFAULT1".to_string(), "triage".to_string())]),
@@ -130,7 +131,7 @@ fn gh_headers(body: &str, event: &str, delivery: &str) -> Headers {
 
 fn gh(name: &str, delivery: &str) -> Result<sf_intake::IntakeEvent, ConnectorError> {
     let body = fixture(name);
-    github::handle(&GithubConfig { webhook_secret: GH_SECRET.into() }, &gh_headers(&body, "issues", delivery), body.as_bytes(), NOW_MS)
+    github::handle(&GithubConfig { source: "github".into(), webhook_secret: GH_SECRET.into() }, &gh_headers(&body, "issues", delivery), body.as_bytes(), NOW_MS)
 }
 
 #[test]
@@ -166,7 +167,7 @@ fn github_reopen_keys_by_delivery() {
 #[test]
 fn github_ignores_other_events_and_actions() {
     let body = fixture("github_issue_closed.json");
-    let cfg = GithubConfig { webhook_secret: GH_SECRET.into() };
+    let cfg = GithubConfig { source: "github".into(), webhook_secret: GH_SECRET.into() };
     assert!(matches!(github::handle(&cfg, &gh_headers(&body, "issues", "d"), body.as_bytes(), NOW_MS), Err(ConnectorError::Unsupported(_))));
     assert!(matches!(github::handle(&cfg, &gh_headers("{}", "ping", "d"), b"{}", NOW_MS), Err(ConnectorError::Unsupported(_))));
 }
@@ -174,11 +175,11 @@ fn github_ignores_other_events_and_actions() {
 #[test]
 fn github_signature_edge_cases() {
     let body = fixture("github_issue_opened.json");
-    let cfg = GithubConfig { webhook_secret: GH_SECRET.into() };
+    let cfg = GithubConfig { source: "github".into(), webhook_secret: GH_SECRET.into() };
     let good = gh_headers(&body, "issues", "d");
     let tampered = body.replace("octocat", "mallory");
     assert_eq!(github::handle(&cfg, &good, tampered.as_bytes(), NOW_MS), Err(ConnectorError::BadSignature));
-    let wrong = GithubConfig { webhook_secret: "nope".into() };
+    let wrong = GithubConfig { source: "github".into(), webhook_secret: "nope".into() };
     assert_eq!(github::handle(&wrong, &good, body.as_bytes(), NOW_MS), Err(ConnectorError::BadSignature));
     let none = Headers::from_pairs(&[("X-GitHub-Event", "issues")]);
     assert_eq!(github::handle(&cfg, &none, body.as_bytes(), NOW_MS), Err(ConnectorError::MissingHeader("X-Hub-Signature-256")));
@@ -191,10 +192,10 @@ fn github_signature_edge_cases() {
 #[test]
 fn github_poll_normalises_issues_and_matches_webhook_key() {
     let list: Vec<serde_json::Value> = serde_json::from_str(&fixture("github_issues_list.json")).unwrap();
-    let e = github::from_issue("acme/shop", &list[0], NOW_MS).unwrap();
+    let e = github::from_issue("github", "acme/shop", &list[0], NOW_MS).unwrap();
     assert_eq!(e.dedupe_key, "github:acme/shop#42:opened");
     assert_eq!(e.dedupe_key, gh("github_issue_opened.json", "d").unwrap().dedupe_key);
     assert_eq!((e.requested_workflow.as_deref(), e.actor.as_str()), (Some("fix-bug"), "octocat"));
-    assert!(matches!(github::from_issue("acme/shop", &list[1], NOW_MS), Err(ConnectorError::Unsupported(_))));
-    assert!(matches!(github::from_issue("acme/shop", &list[2], NOW_MS), Err(ConnectorError::Unsupported(_))));
+    assert!(matches!(github::from_issue("github", "acme/shop", &list[1], NOW_MS), Err(ConnectorError::Unsupported(_))));
+    assert!(matches!(github::from_issue("github", "acme/shop", &list[2], NOW_MS), Err(ConnectorError::Unsupported(_))));
 }

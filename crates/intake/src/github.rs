@@ -12,6 +12,8 @@ pub const LABEL_PREFIX: &str = "factory:";
 
 #[derive(Debug, Clone)]
 pub struct GithubConfig {
+    /// Configured source name: the event's `source`, and the prefix of its dedupe key.
+    pub source: String,
     pub webhook_secret: String,
 }
 
@@ -49,18 +51,18 @@ pub fn handle(cfg: &GithubConfig, headers: &Headers, body: &[u8], now_ms: Timest
         return Err(ConnectorError::Unsupported("no factory:<workflow> label".into()));
     }
     let number = issue.get("number").and_then(Value::as_u64).ok_or_else(|| malformed("issue.number"))?;
-    let base = format!("github:{repo}#{number}:{action}");
+    let base = format!("{}:{repo}#{number}:{action}", cfg.source);
     let dedupe_key = match (action, added, headers.get("X-GitHub-Delivery")) {
         ("labeled", Some(l), _) => format!("{base}:{l}"),
         // A reopen can legitimately recur, so it is keyed by delivery: redelivery dedupes, a new reopen does not.
         ("reopened", _, Some(d)) => format!("{base}:{d}"),
         _ => base,
     };
-    Ok(build(repo, issue, actor.unwrap_or("unknown"), labels, requested_workflow, dedupe_key, now_ms))
+    Ok(build(&cfg.source, repo, issue, actor.unwrap_or("unknown"), labels, requested_workflow, dedupe_key, now_ms))
 }
 
 /// Normalises one issue object from `GET /repos/{repo}/issues` (polling). Pull requests are skipped.
-pub fn from_issue(repo: &str, issue: &Value, now_ms: Timestamp) -> Result<IntakeEvent, ConnectorError> {
+pub fn from_issue(source: &str, repo: &str, issue: &Value, now_ms: Timestamp) -> Result<IntakeEvent, ConnectorError> {
     if issue.get("pull_request").is_some() {
         return Err(ConnectorError::Unsupported("pull request".into()));
     }
@@ -71,13 +73,14 @@ pub fn from_issue(repo: &str, issue: &Value, now_ms: Timestamp) -> Result<Intake
     }
     let number = issue.get("number").and_then(Value::as_u64).ok_or_else(|| malformed("number"))?;
     let actor = issue.pointer("/user/login").and_then(Value::as_str).unwrap_or("unknown");
-    Ok(build(repo, issue, actor, labels, wf, format!("github:{repo}#{number}:opened"), now_ms))
+    Ok(build(source, repo, issue, actor, labels, wf, format!("{source}:{repo}#{number}:opened"), now_ms))
 }
 
-fn build(repo: &str, issue: &Value, actor: &str, labels: Vec<String>, wf: Option<String>, key: String, now: Timestamp) -> IntakeEvent {
+#[allow(clippy::too_many_arguments)]
+fn build(source: &str, repo: &str, issue: &Value, actor: &str, labels: Vec<String>, wf: Option<String>, key: String, now: Timestamp) -> IntakeEvent {
     let number = issue.get("number").and_then(Value::as_u64).unwrap_or(0);
     IntakeEvent {
-        source: "github".into(),
+        source: source.into(),
         source_ref: format!("{repo}#{number}"),
         dedupe_key: key,
         actor: actor.into(),

@@ -268,7 +268,8 @@ fn dispatch_starts_runs_in_priority_order_with_trigger_and_input() {
     for s in started {
         let run = store.get_run(s["run_id"].as_str().unwrap()).unwrap().unwrap();
         let item = store.get_item(s["item_id"].as_str().unwrap()).unwrap().unwrap();
-        assert_eq!(run.trigger_ref, format!("{}:{}", item.source, item.source_ref));
+        let prefix = if item.source == "slack" { "chat:" } else { "" }; // chat sources run under chat:<source>:<ref>
+        assert_eq!(run.trigger_ref, format!("{prefix}{}:{}", item.source, item.source_ref));
         assert_eq!(item.run_id.as_deref(), Some(run.run_id.as_str()));
         let input = store.delivery(&format!("input:{}", run.run_id)).unwrap().unwrap();
         assert_eq!(input["item_id"], item.item_id);
@@ -301,7 +302,7 @@ fn a_chat_run_that_tries_to_deploy_is_forbidden_and_escalated() {
     }
     let s = json_out(&e, &["status", &id]);
     assert_eq!(state, "Escalated", "{s}");
-    assert!(s["escalation"].as_str().unwrap().contains("deploy from chat trigger slack:"), "{s}");
+    assert!(s["escalation"].as_str().unwrap().contains("deploy from chat trigger chat:slack:"), "{s}");
     let effects = std::fs::read_to_string(&e.effects).unwrap_or_default();
     assert!(!effects.lines().any(|l| l.starts_with("deploy ")), "deploy must not run: {effects}");
     let audit = json_out(&e, &["audit", &id]);

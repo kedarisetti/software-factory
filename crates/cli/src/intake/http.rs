@@ -1,6 +1,7 @@
 //! Minimal std-only HTTP/1.1 server for webhooks (TRG-1): thread per connection, Content-Length
 //! bodies only, size and time limits. One JSON log line per request, never payload text or secrets.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -133,19 +134,42 @@ fn write_reply(stream: &mut TcpStream, r: &Reply) -> std::io::Result<()> {
     stream.flush()
 }
 
-fn route(cfg: &Loaded, req: &Request) -> Reply {
-    let post = req.method == "POST";
-    match (req.path.as_str(), post) {
-        ("/healthz", _) if req.method == "GET" => Reply::json(200, "ok", json!({"ok": true})),
-        ("/slack/events", true) => slack_events(cfg, req),
-        ("/github/webhook", true) => github_webhook(cfg, req),
-        ("/healthz" | "/slack/events" | "/github/webhook", false) => Reply::json(405, "method not allowed", json!({"error": "method not allowed"})),
-        _ => Reply::json(404, "not found", json!({"error": "not found"})),
+/// `/slack/events` (the source named `slack`, or the only Slack source), `/slack/<source>/events`;
+/// `/github/webhook` and `/github/<source>/webhook` likewise.
+fn webhook_route(path: &str) -> Option<(&'static str, Option<&str>)> {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["slack", "events"] => Some(("slack", None)),
+        ["slack", name, "events"] => Some(("slack", Some(name))),
+        ["github", "webhook"] => Some(("github", None)),
+        ["github", name, "webhook"] => Some(("github", Some(name))),
+        _ => None,
     }
 }
 
-fn slack_events(cfg: &Loaded, req: &Request) -> Reply {
-    let Some(sc) = &cfg.slack else { return Reply::json(404, "slack not configured", json!({"error": "not configured"})) };
+/// By name, or without one: the source named after its kind (`slack`, `github`), else the only one.
+fn pick<'a, T>(m: &'a BTreeMap<String, T>, name: Option<&str>, kind: &str) -> Option<&'a T> {
+    match name {
+        Some(n) => m.get(n),
+        None => m.get(kind).or_else(|| if m.len() == 1 { m.values().next() } else { None }),
+    }
+}
+
+fn route(cfg: &Loaded, req: &Request) -> Reply {
+    let post = req.method == "POST";
+    if req.path == "/healthz" {
+        return if req.method == "GET" { Reply::json(200, "ok", json!({"ok": true})) } else { Reply::json(405, "method not allowed", json!({"error": "method not allowed"})) };
+    }
+    match webhook_route(&req.path) {
+        None => Reply::json(404, "not found", json!({"error": "not found"})),
+        Some(_) if !post => Reply::json(405, "method not allowed", json!({"error": "method not allowed"})),
+        Some(("slack", name)) => slack_events(cfg, req, name),
+        Some((_, name)) => github_webhook(cfg, req, name),
+    }
+}
+
+fn slack_events(cfg: &Loaded, req: &Request, name: Option<&str>) -> Reply {
+    let Some(sc) = pick(&cfg.slack, name, "slack") else { return Reply::json(404, "slack not configured", json!({"error": "not configured"})) };
     match slack::handle(sc, &req.headers, &req.body, SystemClock.now()) {
         Ok(SlackOutcome::Challenge(c)) => Reply { status: 200, ctype: "text/plain", body: c, result: "challenge".into(), item_id: None },
         Ok(SlackOutcome::Event(ev)) => accepted(cfg.intake.accept(&ev)),
@@ -153,8 +177,8 @@ fn slack_events(cfg: &Loaded, req: &Request) -> Reply {
     }
 }
 
-fn github_webhook(cfg: &Loaded, req: &Request) -> Reply {
-    let Some(gc) = &cfg.github else { return Reply::json(404, "github not configured", json!({"error": "not configured"})) };
+fn github_webhook(cfg: &Loaded, req: &Request, name: Option<&str>) -> Reply {
+    let Some(gc) = pick(&cfg.github, name, "github") else { return Reply::json(404, "github not configured", json!({"error": "not configured"})) };
     match github::handle(gc, &req.headers, &req.body, SystemClock.now()) {
         Ok(ev) => accepted(cfg.intake.accept(&ev)),
         Err(e) => rejected(&e),

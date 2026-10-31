@@ -373,7 +373,7 @@ fn main() {
     };
 
     let out = match cmd.as_str() {
-        "intake" => ex(intake::run(&rest[1..], store.clone(), &engine)),
+        "intake" => ex(intake::run(&rest[1..], store.clone(), &engine, &db, named(&flags, "--as"))),
         "feedback" => match arg(1).as_str() {
             "add" => {
                 let target = ex(parse_target(&named(&flags, "--target").unwrap_or_else(|| die("--target <t> is required"))));

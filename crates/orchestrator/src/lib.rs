@@ -9,8 +9,10 @@ pub mod policy;
 
 pub use policy::{Gate, Policy};
 
-/// Trigger sources that are chat. A run triggered from chat can never deploy (GOV, SBX-3).
-pub const CHAT_SOURCES: [&str; 1] = ["slack"];
+/// Trigger ref prefixes that are chat. A run triggered from chat can never deploy (GOV, SBX-3).
+/// Intake dispatches every chat source (kind `slack`, or `chat: true`) as `chat:<source>:<ref>`;
+/// `slack` is kept for runs started before that scheme.
+pub const CHAT_SOURCES: [&str; 2] = ["slack", "chat"];
 
 fn from_chat(trigger_ref: &str) -> bool {
     CHAT_SOURCES.iter().any(|s| trigger_ref.strip_prefix(s).is_some_and(|r| r.starts_with(':')))

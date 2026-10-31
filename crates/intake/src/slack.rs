@@ -13,6 +13,8 @@ pub const MAX_SKEW_SECS: i64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct SlackConfig {
+    /// Configured source name: the event's `source`, and the prefix of its dedupe key.
+    pub source: String,
     pub signing_secret: String,
     pub bot_user_id: String,
     /// Channel id -> workflow used when the message names none.
@@ -76,9 +78,9 @@ fn event(cfg: &SlackConfig, v: &serde_json::Value, now_ms: Timestamp) -> Result<
     let (named, rest) = parse_command(text, &mention);
     let requested_workflow = named.or_else(|| cfg.channel_defaults.get(channel).cloned());
     Ok(IntakeEvent {
-        source: "slack".into(),
+        source: cfg.source.clone(),
         source_ref: format!("{channel}/{ts}"),
-        dedupe_key: format!("slack:{event_id}"),
+        dedupe_key: format!("{}:{event_id}", cfg.source),
         actor: user.into(),
         channel: channel.into(),
         title: rest.lines().next().unwrap_or("").chars().take(80).collect(),

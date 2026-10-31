@@ -1,11 +1,19 @@
-//! Local process sandbox: a local approximation of SBX-1 plus SBX-4.
+//! Local process sandbox: SBX-1 via bubblewrap plus SBX-4.
 //!
-//! **Not enforced locally yet: the network egress allowlist (SBX-1).** Commands run as ordinary
-//! child processes with full network access; egress control is milestone 3.
+//! `LocalSandbox::new` runs each call under `bwrap` (SBX-1): only a read-only system layer and the
+//! call's own workspace (`<root>/ws/<workspace>`, also `HOME`) are visible, in fresh pid, ipc, uts,
+//! user and net namespaces. With empty `egress` there is no network; otherwise traffic goes only
+//! through a per-call allowlist proxy (Unix socket bridged by `sf-netshim`), and every attempt is
+//! returned in `ToolOutput.egress`. The shim is any binary that serves `netshim::main` when its file name
+//! is `sf-netshim` (the sandbox binds it at `/run/sf-netshim`; `sf` does this). If `bwrap` or the shim is unavailable, `run` fails closed with
+//! `Error::Forbidden`. `LocalSandbox::unconfined` skips isolation, does NOT meet SBX-1 and refuses
+//! any call with egress rules.
 //!
-//! Enforced here: filesystem scoping of the working directory to a root (SBX-1), a scrubbed
-//! environment with no inherited parent secrets (SBX-2), and wall-clock, output-size and
-//! kill-switch limits that kill the child's whole process group (SBX-4).
+//! Also enforced: a scrubbed environment with no inherited parent secrets (SBX-2), and wall-clock,
+//! output-size and kill-switch limits that kill the child's whole process group (SBX-4).
+
+pub mod netshim;
+mod proxy;
 
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
@@ -17,41 +25,146 @@ use std::time::{Duration, Instant};
 use sf_core::{Error, KillSwitch, Limits, Result, Sandbox, ToolCall, ToolOutput};
 
 const POLL: Duration = Duration::from_millis(10);
+const SHIM_IN_SANDBOX: &str = "/run/sf-netshim";
+const SOCK_DIR_IN_SANDBOX: &str = "/run/sf";
 
-/// Runs tool calls as child processes confined (by cwd) to `root`.
+/// Runs tool calls as child processes confined to `root` (and, unless unconfined, to a bwrap sandbox).
 #[derive(Debug, Clone)]
 pub struct LocalSandbox {
     root: PathBuf,
+    isolate: bool,
+    shim: Option<PathBuf>,
 }
 
 impl LocalSandbox {
-    /// Creates `root` if needed. Commands run with cwd inside it and `HOME` set to it.
+    /// Creates `root` if needed. Calls run under bwrap with `HOME` set to their workspace (SBX-1).
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(|e| Error::Invalid(format!("sandbox root: {e}")))?;
         let root = root.canonicalize().map_err(|e| Error::Invalid(format!("sandbox root: {e}")))?;
-        Ok(LocalSandbox { root })
+        Ok(LocalSandbox { root, isolate: true, shim: None })
     }
 
-    /// Resolves `ToolCall.cwd` under the root; `..`, absolute paths and symlink escapes are rejected (SBX-1).
-    fn resolve_cwd(&self, cwd: Option<&str>) -> Result<PathBuf> {
-        let Some(rel) = cwd else { return Ok(self.root.clone()) };
+    /// No isolation, for hosts without bwrap. Does NOT meet SBX-1: only cwd is scoped, the network
+    /// is open, and any call with non-empty `egress` is `Forbidden` (no allowlist can be enforced).
+    pub fn unconfined(root: impl Into<PathBuf>) -> Result<Self> {
+        Ok(LocalSandbox { isolate: false, ..Self::new(root)? })
+    }
+
+    /// Sets the `sf-netshim` binary used for calls with egress rules.
+    pub fn with_shim(mut self, path: impl Into<PathBuf>) -> Self {
+        self.shim = Some(path.into());
+        self
+    }
+
+    /// Shim lookup: explicit, `SF_NETSHIM`, next to the current exe, then its parent dir.
+    fn find_shim(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.shim {
+            return p.is_file().then(|| p.clone());
+        }
+        if let Some(p) = std::env::var_os("SF_NETSHIM") {
+            let p = PathBuf::from(p);
+            return p.is_file().then_some(p);
+        }
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        [dir.to_path_buf(), dir.parent()?.to_path_buf()].into_iter().map(|d| d.join("sf-netshim")).find(|p| p.is_file())
+    }
+
+    /// Maps `ToolCall.workspace` to its directory, creating it on demand (SBX-1).
+    fn workspace(&self, name: &str) -> Result<PathBuf> {
+        if name.is_empty() {
+            return Ok(self.root.clone());
+        }
+        let ok = name != "." && name != ".." && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        if !ok {
+            return Err(Error::Invalid(format!("bad workspace name: {name}")));
+        }
+        let dir = self.root.join("ws").join(name);
+        std::fs::create_dir_all(&dir).map_err(|e| Error::Invalid(format!("workspace {name}: {e}")))?;
+        dir.canonicalize().map_err(|e| Error::Invalid(format!("workspace {name}: {e}")))
+    }
+
+    /// Resolves `ToolCall.cwd` under the workspace `base`; `..`, absolute paths and symlink escapes are rejected (SBX-1).
+    fn resolve_cwd(base: &Path, cwd: Option<&str>) -> Result<PathBuf> {
+        let Some(rel) = cwd else { return Ok(base.to_path_buf()) };
         let rel = Path::new(rel);
         let escapes = rel.is_absolute()
             || rel.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)));
         if escapes {
             return Err(Error::Invalid(format!("cwd escapes sandbox root: {}", rel.display())));
         }
-        let full = self
-            .root
+        let full = base
             .join(rel)
             .canonicalize()
             .map_err(|e| Error::Invalid(format!("cwd {}: {e}", rel.display())))?;
-        if !full.starts_with(&self.root) {
+        if !full.starts_with(base) {
             return Err(Error::Invalid(format!("cwd escapes sandbox root: {}", rel.display())));
         }
         Ok(full)
     }
+
+    /// The bwrap invocation: read-only system layer, the workspace at its own path, no other host files.
+    fn bwrap(ws: &Path, cwd: &Path, bridge: Option<(&Path, &Path)>) -> Command {
+        let mut c = Command::new("bwrap");
+        c.args(["--unshare-all", "--die-with-parent", "--ro-bind", "/usr", "/usr"]);
+        for d in ["/bin", "/lib", "/lib64", "/sbin"] {
+            match std::fs::read_link(d) {
+                Ok(t) => c.arg("--symlink").arg(t).arg(d),
+                Err(_) => c.args(["--ro-bind-try", d, d]),
+            };
+        }
+        for d in ["/etc/ssl", "/etc/ca-certificates", "/etc/alternatives", "/etc/ld.so.cache"] {
+            c.args(["--ro-bind-try", d, d]);
+        }
+        c.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+        c.arg("--bind").arg(ws).arg(ws);
+        if let Some((sock_dir, shim)) = bridge {
+            c.arg("--bind").arg(sock_dir).arg(SOCK_DIR_IN_SANDBOX);
+            c.arg("--ro-bind").arg(shim).arg(SHIM_IN_SANDBOX);
+        }
+        c.arg("--chdir").arg(cwd);
+        c.arg("--");
+        c
+    }
+
+    /// Builds the command for `call`: bwrap-wrapped (optionally via the shim) or direct when unconfined.
+    fn command(&self, call: &ToolCall, ws: &Path, cwd: &Path, bridge: Option<(&Path, &Path)>) -> Command {
+        let mut c = if self.isolate {
+            let mut c = Self::bwrap(ws, cwd, bridge);
+            if bridge.is_some() {
+                c.arg(SHIM_IN_SANDBOX).arg(format!("{SOCK_DIR_IN_SANDBOX}/p.sock")).arg("--");
+            }
+            c.arg(&call.program);
+            c
+        } else {
+            let mut c = Command::new(&call.program);
+            c.current_dir(cwd);
+            c
+        };
+        c.args(&call.args)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", ws)
+            .envs(call.env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        c
+    }
+}
+
+/// Maps a failed bwrap/shim start (reported on stderr, exit 1/127) to the right error; `None` = the program ran.
+fn launch_failure(call: &ToolCall, code: Option<i32>, stderr: &str) -> Option<Error> {
+    if let Some(m) = stderr.strip_prefix("bwrap: execvp ").filter(|_| code == Some(1)) {
+        return Some(Error::Invalid(format!("failed to spawn {}: {}", call.program, m.trim())));
+    }
+    if stderr.starts_with("sf-netshim: spawn ") && code == Some(127) {
+        return Some(Error::Invalid(format!("failed to spawn {}: {}", call.program, stderr.trim())));
+    }
+    (code == Some(1) && stderr.starts_with("bwrap: "))
+        .then(|| Error::Forbidden(format!("isolation unavailable: {}", stderr.trim())))
 }
 
 /// SIGKILLs the whole process group `pgid`, best effort.
@@ -111,22 +224,40 @@ impl Sandbox for LocalSandbox {
         if kill.is_tripped() {
             return Err(Error::Killed);
         }
-        let cwd = self.resolve_cwd(call.cwd.as_deref())?;
+        let shim = if call.egress.is_empty() {
+            None
+        } else if !self.isolate {
+            return Err(Error::Forbidden("unconfined sandbox cannot enforce an egress allowlist".into()));
+        } else {
+            Some(self.find_shim().ok_or_else(|| Error::Forbidden("isolation unavailable: sf-netshim not found".into()))?)
+        };
+        let ws = self.workspace(&call.workspace)?;
+        let cwd = Self::resolve_cwd(&ws, call.cwd.as_deref())?;
+        let proxy = match &shim {
+            Some(_) => Some(
+                proxy::Proxy::start(call.egress.clone())
+                    .map_err(|e| Error::Forbidden(format!("isolation unavailable: proxy: {e}")))?,
+            ),
+            None => None,
+        };
+        let bridge = proxy.as_ref().zip(shim.as_deref()).map(|(p, s)| (p.dir(), s));
         let start = Instant::now();
-        let mut child = Command::new(&call.program)
-            .args(&call.args)
-            .current_dir(cwd)
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", &self.root)
-            .envs(call.env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| Error::Invalid(format!("failed to spawn {}: {e}", call.program)))?;
+        let spawned = self.command(call, &ws, &cwd, bridge).spawn();
+        let result = match spawned {
+            Ok(child) => Self::supervise(call, child, limits, kill, start),
+            Err(e) if self.isolate && e.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::Forbidden("isolation unavailable: bwrap not found".into()))
+            }
+            Err(e) => Err(Error::Invalid(format!("failed to spawn {}: {e}", call.program))),
+        };
+        let egress = proxy.map(proxy::Proxy::finish).unwrap_or_default();
+        result.map(|o| ToolOutput { egress, ..o })
+    }
+}
 
+impl LocalSandbox {
+    /// Feeds stdin, captures capped output and enforces the SBX-4 limits on a spawned child.
+    fn supervise(call: &ToolCall, mut child: Child, limits: &Limits, kill: &KillSwitch, start: Instant) -> Result<ToolOutput> {
         let cap = limits.max_output_bytes;
         let out = drain(child.stdout.take().expect("piped"), cap);
         let err = drain(child.stderr.take().expect("piped"), cap);
@@ -141,12 +272,16 @@ impl Sandbox for LocalSandbox {
         let _ = feeder.join();
         let ((stdout, t1), (stderr, t2)) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
         let status = status?;
+        if let Some(e) = launch_failure(call, status.code(), &stderr) {
+            return Err(e);
+        }
         Ok(ToolOutput {
             exit_code: status.code(),
             stdout,
             stderr,
             duration_ms: start.elapsed().as_millis() as u64,
             truncated: t1 || t2,
+            egress: Vec::new(),
         })
     }
 }
@@ -263,5 +398,92 @@ mod tests {
         let (_d, s) = sb();
         let s: Arc<dyn Sandbox> = Arc::new(s);
         assert_eq!(s.run(&sh("echo x"), &Limits::default(), &KillSwitch::new()).unwrap().stdout, "x\n");
+    }
+
+    fn ws(name: &str, script: &str) -> ToolCall {
+        ToolCall { workspace: name.into(), ..sh(script) }
+    }
+
+    #[test]
+    fn workspace_is_home_cwd_and_created_on_demand() {
+        let (_d, s) = sb();
+        let o = run(&s, &ws("run1", "echo $HOME; pwd; touch f")).unwrap();
+        let w = s.root.join("ws/run1");
+        assert_eq!(o.stdout, format!("{0}\n{0}\n", w.display()));
+        assert!(w.join("f").exists());
+    }
+
+    #[test]
+    fn bad_workspace_names_rejected() {
+        let (_d, s) = sb();
+        for bad in [".", "..", "a/b", "../x", "a b", "/etc"] {
+            assert!(matches!(run(&s, &ws(bad, "true")), Err(Error::Invalid(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn host_files_outside_workspace_are_invisible() {
+        let (d, s) = sb();
+        let canary = d.path().join("canary");
+        std::fs::write(&canary, "secret").unwrap();
+        let o = run(&s, &ws("w", &format!("cat {} 2>&1; ls /home 2>&1; ls {} 2>&1", canary.display(), d.path().display()))).unwrap();
+        assert!(!o.stdout.contains("secret"), "{}", o.stdout);
+        assert!(o.stdout.contains("No such file"), "{}", o.stdout);
+    }
+
+    #[test]
+    fn writes_outside_workspace_do_not_reach_host() {
+        let (d, s) = sb();
+        let name = format!("sf-host-probe-{}", std::process::id());
+        let o = run(&s, &ws("w", &format!("echo x > /tmp/{name}; cat /tmp/{name}"))).unwrap();
+        assert_eq!(o.stdout, "x\n");
+        assert!(!Path::new("/tmp").join(&name).exists());
+        drop(d);
+    }
+
+    #[test]
+    fn workspaces_cannot_see_each_other() {
+        let (_d, s) = sb();
+        run(&s, &ws("a", "echo mine > f")).unwrap();
+        let o = run(&s, &ws("b", &format!("cat {}/ws/a/f 2>&1; ls {}/ws 2>&1", s.root.display(), s.root.display()))).unwrap();
+        assert!(!o.stdout.contains("mine") && o.stdout.ends_with("\nb\n"), "{}", o.stdout);
+    }
+
+    #[test]
+    fn no_network_without_egress() {
+        let (_d, s) = sb();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let p = l.local_addr().unwrap().port();
+        let o = run(&s, &ws("w", &format!("curl -s -m 3 http://127.0.0.1:{p}/"))).unwrap();
+        assert_ne!(o.exit_code, Some(0));
+        assert!(l.accept().is_err());
+        assert!(o.egress.is_empty());
+    }
+
+    #[test]
+    fn missing_bwrap_fails_closed() {
+        assert!(matches!(
+            launch_failure(&sh("true"), Some(1), "bwrap: No permissions to create new namespace\n"),
+            Some(Error::Forbidden(m)) if m.starts_with("isolation unavailable")
+        ));
+        assert!(launch_failure(&sh("true"), Some(1), "plain failure").is_none());
+    }
+
+    #[test]
+    fn unconfined_rejects_egress_and_runs_otherwise() {
+        let d = tempfile::tempdir().unwrap();
+        let s = LocalSandbox::unconfined(d.path().join("root")).unwrap();
+        let c = ToolCall { egress: vec![sf_core::HostRule { host: "example.com".into(), port: None }], ..sh("true") };
+        assert!(matches!(run(&s, &c), Err(Error::Forbidden(_))));
+        assert_eq!(run(&s, &sh("echo ok")).unwrap().stdout, "ok\n");
+    }
+
+    #[test]
+    fn missing_shim_with_egress_is_forbidden() {
+        let (_d, s) = sb();
+        let s = s.with_shim("/nonexistent/sf-netshim");
+        let c = ToolCall { egress: vec![sf_core::HostRule { host: "example.com".into(), port: None }], ..sh("true") };
+        assert!(matches!(run(&s, &c), Err(Error::Forbidden(_))));
     }
 }

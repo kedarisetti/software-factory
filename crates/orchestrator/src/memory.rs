@@ -1,11 +1,11 @@
 //! In-memory `Store` test double with the same contract as the SQLite store: atomic commit,
-//! duplicate-seq `Conflict`, write-once effect ledger and inbox.
+//! duplicate-seq `Conflict`, write-once effect ledger and inbox, hash-chained audit log deduped by key.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use sf_core::{Commit, Error, Event, Result, Run, RunState, Step, Store};
+use sf_core::{AuditRecord, Commit, Error, Event, Result, Run, RunState, Step, Store};
 
 #[derive(Default)]
 struct Inner {
@@ -14,6 +14,7 @@ struct Inner {
     events: HashMap<String, Vec<Event>>,
     effects: HashMap<String, Value>,
     inbox: HashMap<String, Value>,
+    audit: Vec<AuditRecord>,
 }
 
 #[derive(Default)]
@@ -101,5 +102,23 @@ impl Store for MemoryStore {
 
     fn delivery(&self, key: &str) -> Result<Option<Value>> {
         Ok(self.0.lock().unwrap().inbox.get(key).cloned())
+    }
+
+    fn append_audit(&self, rec: &AuditRecord) -> Result<AuditRecord> {
+        let mut g = self.0.lock().unwrap();
+        if let Some(r) = g.audit.iter().find(|r| r.key == rec.key) {
+            return Ok(r.clone());
+        }
+        let mut r = rec.clone();
+        r.seq = g.audit.len() as u64;
+        r.prev_hash = g.audit.last().map(|p| p.hash.clone()).unwrap_or_default();
+        r.hash = r.compute_hash();
+        g.audit.push(r.clone());
+        Ok(r)
+    }
+
+    fn read_audit(&self, run_id: Option<&str>) -> Result<Vec<AuditRecord>> {
+        let g = self.0.lock().unwrap();
+        Ok(g.audit.iter().filter(|r| run_id.is_none_or(|id| r.run_id == id)).cloned().collect())
     }
 }

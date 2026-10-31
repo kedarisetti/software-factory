@@ -1,4 +1,4 @@
-//! `Kb`: the file-backed implementation of `Knowledge` (KIF-1 to KIF-7) laid out as a wiki (WIKI-1 to WIKI-7).
+//! `Kb`: the file-backed implementation of `Knowledge` (KIF-1 to KIF-7) laid out as a wiki (WIKI-1 to WIKI-9).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -62,6 +62,42 @@ fn parse_at(text: &str, path: &Path, id: &str) -> Result<Entry> {
     Ok(e)
 }
 
+/// Result of [`Kb::scan`]: folders changed, edited entry files as `(id, path)`, newest mtime.
+type Scan = (bool, Vec<(String, PathBuf)>, SystemTime);
+
+fn mtime(p: &Path) -> Option<SystemTime> {
+    fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// RET-5: is `dir` or any folder below it (one topic level) newer than `since`?
+fn newer_dirs(dir: &Path, depth: usize, since: SystemTime) -> bool {
+    let mut hit = mtime(dir).is_some_and(|t| t > since);
+    if depth < 2 {
+        for ent in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = ent.path();
+            hit |= p.is_dir() && !ent.file_name().to_string_lossy().starts_with('.') && newer_dirs(&p, depth + 1, since);
+        }
+    }
+    hit
+}
+
+fn read_at(path: &Path, id: &str) -> Result<Entry> {
+    parse_at(&fs::read_to_string(path)?, path, id)
+}
+
+/// Read many files, splitting off the ones that fail (WIKI-9).
+fn read_all(files: Vec<(String, PathBuf)>) -> (Vec<Entry>, Vec<Unreadable>) {
+    let (mut ok, mut bad) = (vec![], vec![]);
+    for (id, path) in files {
+        match read_at(&path, &id) {
+            Ok(e) => ok.push(e),
+            Err(Error::Parse { msg, .. }) => bad.push(Unreadable { path: format!("{id}.md"), reason: msg }),
+            Err(e) => bad.push(Unreadable { path: format!("{id}.md"), reason: e.to_string() }),
+        }
+    }
+    (ok, bad)
+}
+
 /// Entry files below `dir` (a kind folder, at most one topic level down), as `(id, path)`.
 fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
     let rd = match fs::read_dir(dir) {
@@ -117,14 +153,74 @@ impl Kb {
     }
 
     /// Re-index every entry file (RET-5 nightly rebuild, or a fresh cache) and regenerate the `index.md` files.
-    /// A file that does not parse is an `Error::Parse` naming it.
+    /// Files that do not parse are skipped and listed in the root `index.md` (WIKI-9). Returns the entries indexed.
     pub fn rebuild_index(&self) -> Result<usize> {
         let _lock = self.lock()?;
-        let entries = self.load_all()?;
-        self.regen_with(&entries)?;
+        self.rebuild_locked()
+    }
+
+    /// Full rebuild of index and wiki files; caller holds the lock.
+    fn rebuild_locked(&self) -> Result<usize> {
+        let (entries, bad) = self.load_all()?;
+        self.regen_with(&entries, &bad)?;
         let n = entries.len();
         self.index.rebuild(&mut entries.into_iter())?;
         Ok(n)
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.root.join(".kb").join("indexed-at")
+    }
+
+    /// RET-5: set the `.kb/indexed-at` marker's mtime to now (or `newest`, if an entry file is dated later),
+    /// so the kb's own writes never look like hand edits. Caller holds the lock.
+    fn touch_marker(&self, newest: SystemTime) -> Result<()> {
+        let f = OpenOptions::new().create(true).write(true).truncate(false).open(self.marker())?;
+        f.set_modified(SystemTime::now().max(newest))?;
+        Ok(())
+    }
+
+    /// RET-5: stat the kind folders. Returns whether any folder is newer than `since` (entry added, deleted or
+    /// renamed), the entry files newer than `since` (edited in place), and the newest mtime seen.
+    fn scan(&self, since: SystemTime) -> Result<Scan> {
+        let (mut dirs, mut newest, mut changed) = (false, UNIX_EPOCH, vec![]);
+        for k in KINDS {
+            let (dir, mut files) = (self.root.join(k.dir()), vec![]);
+            dirs |= newer_dirs(&dir, 1, since);
+            walk(&dir, k.dir(), 1, &mut files)?;
+            for (id, path) in files {
+                if let Some(t) = mtime(&path).filter(|t| *t > since) {
+                    newest = newest.max(t);
+                    changed.push((id, path));
+                }
+            }
+        }
+        Ok((dirs, changed, newest))
+    }
+
+    /// RET-5: pick up hand edits before a search or list. Cheap stat walk first; only when something is newer than
+    /// the marker take the writer lock, re-check, and re-index (full rebuild if a file was added or deleted,
+    /// else upsert the edited files), regenerate the wiki and touch the marker.
+    fn refresh(&self) -> Result<()> {
+        let since = || mtime(&self.marker()).unwrap_or(UNIX_EPOCH);
+        let (dirs, files, _) = self.scan(since())?;
+        if !dirs && files.is_empty() {
+            return Ok(());
+        }
+        let _lock = self.lock()?;
+        let (dirs, files, newest) = self.scan(since())?;
+        if dirs {
+            self.rebuild_locked()?;
+        } else if !files.is_empty() {
+            for (id, path) in files {
+                match read_at(&path, &id) {
+                    Ok(e) => self.index.upsert(&e)?,
+                    Err(_) => self.index.remove(&id)?,
+                }
+            }
+            self.regen()?;
+        }
+        self.touch_marker(newest)
     }
 
     /// KIF-8 handshake for front doors.
@@ -160,14 +256,15 @@ impl Kb {
         }
     }
 
-    /// Every entry, skipping `index.md`, `log.md`, `AGENTS.md` and temp files (they are not under a kind folder or are named so).
-    fn load_all(&self) -> Result<Vec<Entry>> {
+    /// Every readable entry, skipping `index.md`, `log.md`, `AGENTS.md` and temp files (they are not under a kind
+    /// folder or are named so). Files that do not read or parse come back as `Unreadable`, never as an error (WIKI-9).
+    fn load_all(&self) -> Result<(Vec<Entry>, Vec<Unreadable>)> {
         let mut files = vec![];
         for k in KINDS {
             walk(&self.root.join(k.dir()), k.dir(), 1, &mut files)?;
         }
         files.sort();
-        files.iter().map(|(id, path)| parse_at(&fs::read_to_string(path)?, path, id)).collect()
+        Ok(read_all(files))
     }
 
     /// Atomic write (temp file, fsync, rename) then index upsert. Caller holds the lock (KIF-7).
@@ -180,19 +277,37 @@ impl Kb {
         self.index.upsert(entry)
     }
 
-    /// WIKI-2: rewrite every `index.md` whose text changed.
-    fn regen_with(&self, entries: &[Entry]) -> Result<()> {
-        for (dir, text) in wiki::render_indexes(entries) {
+    /// WIKI-8: every Active page `derived-from` `src` (which just left Active or got `misled`/`wrong` feedback)
+    /// becomes Stale, is written and logged. One hop only: a page going stale does not cascade. Caller holds the lock.
+    fn stale_dependents(&self, caller: &Caller, src: &str, reason: &str) -> Result<Vec<EntryId>> {
+        let mut out = vec![];
+        for mut p in self.load_all()?.0 {
+            let derived = p.meta.links.iter().any(|l| l.kind == LinkType::DerivedFrom && l.target == src);
+            if p.meta.kind == EntryKind::Page && p.meta.status == EntryStatus::Active && derived {
+                p.meta.status = EntryStatus::Stale;
+                p.meta.updated_at = (self.now)();
+                self.store(&p)?;
+                self.change(caller, "stale", &p.meta.id, &format!("source {src} {reason}"))?;
+                out.push(p.meta.id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// WIKI-2: rewrite every `index.md` whose text changed, then touch the RET-5 marker (our own writes are not hand edits).
+    fn regen_with(&self, entries: &[Entry], bad: &[Unreadable]) -> Result<()> {
+        for (dir, text) in wiki::render_indexes(entries, bad) {
             let path = self.root.join(&dir).join("index.md");
             if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
                 wiki::write_atomic(&path, text.as_bytes())?;
             }
         }
-        Ok(())
+        self.touch_marker(UNIX_EPOCH)
     }
 
     fn regen(&self) -> Result<()> {
-        self.regen_with(&self.load_all()?)
+        let (entries, bad) = self.load_all()?;
+        self.regen_with(&entries, &bad)
     }
 
     /// WIKI-3: append one line to `log.md`. Caller holds the lock.
@@ -218,7 +333,7 @@ impl Kb {
     fn load_dir(&self, dir: &str) -> Result<Vec<Entry>> {
         let mut files = vec![];
         walk(&self.root.join(dir), dir, 2, &mut files)?;
-        files.iter().map(|(id, path)| parse_at(&fs::read_to_string(path)?, path, id)).collect()
+        Ok(read_all(files).0)
     }
 
     /// Move a v1 `<root>/entries/<id>.md` store into the wiki layout, rewriting links to the new IDs.
@@ -234,8 +349,11 @@ impl Kb {
             if name.starts_with('.') || !name.ends_with(".md") {
                 continue;
             }
-            let text = fs::read_to_string(&path)?;
-            old.push((path.clone(), parse_entry(&text).map_err(|msg| Error::Parse { path: path.display().to_string(), msg })?));
+            // WIKI-9: a file that does not parse stays where it is and is logged.
+            match fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| parse_entry(&t)) {
+                Ok(e) => old.push((path.clone(), e)),
+                Err(msg) => eprintln!("sf-kb: migration skipped {}: {msg}", path.display()),
+            }
         }
         old.sort_by(|a, b| (a.1.meta.created_at, &a.1.meta.id).cmp(&(b.1.meta.created_at, &b.1.meta.id)));
         let (mut taken, mut map) = (HashSet::new(), HashMap::new());
@@ -285,12 +403,13 @@ impl Kb {
         if top_k == 0 {
             return Err(Error::Invalid("top_k must be at least 1".into()));
         }
+        self.refresh()?;
         let now = (self.now)();
         let mut hits = vec![];
         for (id, score) in self.index.search(query, task_class, top_k * 2 + 5)? {
             let e = match self.load(&id) {
                 Ok(e) => e,
-                Err(Error::NotFound(_)) => continue,
+                Err(Error::NotFound(_) | Error::Parse { .. }) => continue, // WIKI-9: unreadable counts as missing
                 Err(e) => return Err(e),
             };
             let m = &e.meta;
@@ -322,9 +441,10 @@ impl Kb {
             return Err(Error::NotFound(path.to_string()));
         }
         let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+        self.refresh()?;
         let mut dirs: HashMap<String, usize> = HashMap::new();
         let mut items = vec![];
-        for e in self.load_all()? {
+        for e in self.load_all()?.0 {
             let Some(rest) = e.meta.id.strip_prefix(&prefix) else { continue };
             match rest.split_once('/') {
                 Some((d, _)) => *dirs.entry(format!("{prefix}{d}")).or_default() += 1,
@@ -353,6 +473,15 @@ impl Kb {
         let now = (self.now)();
         let kind = new.kind.unwrap_or(EntryKind::Note);
         let _lock = self.lock()?;
+        // WIKI-8: a `supersedes` target must exist; checked before anything is written.
+        let mut superseded = vec![];
+        for l in new.links.iter().filter(|l| l.kind == LinkType::Supersedes) {
+            match self.load(&l.target) {
+                Ok(t) => superseded.push(t),
+                Err(Error::NotFound(_)) => return Err(Error::Invalid(format!("supersedes target {} does not exist", l.target))),
+                Err(e) => return Err(e),
+            }
+        }
         let dir = wiki::dir_of(kind, new.task_class.as_deref(), &new.tags);
         let meta = Meta {
             id: self.unique_id(&dir, &wiki::entry_slug(&title), &HashSet::new()),
@@ -378,6 +507,14 @@ impl Kb {
         let entry = Entry { meta, body: new.body };
         self.store(&entry)?;
         self.change(caller, "add", &entry.meta.id, kind_str(kind))?;
+        // WIKI-8: adding a page that supersedes another expires it, and pages derived from it go stale.
+        for mut t in superseded.into_iter().filter(|t| t.meta.status != EntryStatus::Expired) {
+            t.meta.status = EntryStatus::Expired;
+            t.meta.updated_at = now;
+            self.store(&t)?;
+            self.change(caller, "expire", &t.meta.id, &format!("superseded by {}", entry.meta.id))?;
+            self.stale_dependents(caller, &t.meta.id, "expired")?;
+        }
         self.regen()?;
         Ok(entry)
     }
@@ -415,6 +552,7 @@ impl Kb {
                     old.meta.updated_at = now;
                     self.store(&old)?;
                     self.change(caller, "expire", &old.meta.id, "contradicted by a later outcome")?;
+                    self.stale_dependents(caller, &old.meta.id, "expired")?;
                     out.expired.push(old.meta.id.clone());
                     contradicted = Some(Link { kind: LinkType::Contradicts, target: old.meta.id.clone() });
                 }
@@ -487,7 +625,11 @@ impl Kb {
         }
         e.meta.updated_at = (self.now)();
         self.store(&e)?;
-        self.change(caller, "feedback", id, &format!("{verdict:?}").to_lowercase())?;
+        let v = format!("{verdict:?}").to_lowercase();
+        self.change(caller, "feedback", id, &v)?;
+        if verdict != Verdict::Helped {
+            self.stale_dependents(caller, id, &v)?; // WIKI-8: expired, misled or wrong
+        }
         self.regen()?;
         Ok(e)
     }
@@ -495,17 +637,17 @@ impl Kb {
     fn do_check_anchors(&self, caller: &Caller) -> Result<AnchorReport> {
         let _lock = self.lock()?;
         let now = (self.now)();
-        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![], dangling_links: vec![] };
-        let entries = self.load_all()?;
+        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![], dangling_links: vec![], unreadable: vec![], stale_pages: vec![] };
+        let (entries, bad) = self.load_all()?;
+        report.unreadable = bad;
         let ids: HashSet<&str> = entries.iter().map(|e| e.meta.id.as_str()).collect();
         for e in &entries {
             for l in e.meta.links.iter().filter(|l| !ids.contains(l.target.as_str())) {
                 report.dangling_links.push(DanglingLink { from: e.meta.id.clone(), to: l.target.clone() });
             }
         }
-        let mut changed = false;
         for mut e in entries.clone() {
-            if e.meta.anchors.is_empty() {
+            if e.meta.anchors.is_empty() || report.stale_pages.contains(&e.meta.id) {
                 continue;
             }
             let mut any_broken = false;
@@ -529,11 +671,11 @@ impl Kb {
             e.meta.updated_at = now;
             self.store(&e)?;
             self.change(caller, op, &e.meta.id, "check_anchors")?;
-            changed = true;
+            if new_status == EntryStatus::BrokenAnchor {
+                report.stale_pages.extend(self.stale_dependents(caller, &e.meta.id, "broken-anchor")?);
+            }
         }
-        if changed {
-            self.regen()?;
-        }
+        self.rebuild_locked()?; // RET-5: the nightly full rebuild
         Ok(report)
     }
 }
@@ -997,5 +1139,126 @@ mod tests {
         assert!(read(&dir, "index.md").contains("learnings/") && read(&dir, "log.md").contains("migrate [[notes/general/writer-lock]]"));
         assert!(kb.check_anchors(&c).unwrap().dangling_links.is_empty());
         assert_eq!(kb.rebuild_index().unwrap(), 2);
+    }
+
+    fn derived(t: &str) -> Link {
+        Link { kind: LinkType::DerivedFrom, target: t.into() }
+    }
+
+    /// Date a file (or folder) 10s ahead so a hand edit is newer than the marker whatever the clock granularity.
+    fn bump(path: &Path) {
+        File::open(path).unwrap().set_modified(SystemTime::now() + std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    fn page(kb: &Kb, c: &Caller, title: &str, links: Vec<Link>) -> EntryId {
+        kb.add(c, NewEntry { kind: Some(EntryKind::Page), links, ..note(title, "zebra overview") }).unwrap().meta.id
+    }
+
+    #[test]
+    fn corrupt_file_does_not_block_writes_or_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "s1");
+        let bad = kb.add(&c, note("Broken zebra", "zebra")).unwrap().meta.id;
+        let good = kb.add(&c, note("Good zebra", "zebra")).unwrap().meta.id;
+        fs::write(kb.entry_path(&bad), "not an entry\n").unwrap();
+        let fresh = kb.add(&c, note("Fresh zebra", "zebra")).unwrap().meta.id;
+        kb.learn(&c, rec(Outcome::Succeeded, &["still works"])).unwrap();
+        kb.feedback(&c, &good, Verdict::Helped, None).unwrap();
+        let ids: HashSet<_> = kb.search(&c, "zebra", None, 10).unwrap().into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, [good, fresh].into());
+        assert_eq!(kb.list(&c, "notes/general").unwrap().entries.len(), 2);
+        let root = read(&dir, "index.md");
+        assert!(root.contains("## Needs attention") && root.contains(&format!("[{bad}.md]({bad}.md)")), "{root}");
+        let r = kb.check_anchors(&c).unwrap();
+        assert_eq!(r.unreadable.iter().map(|u| u.path.clone()).collect::<Vec<_>>(), [format!("{bad}.md")]);
+        assert!(matches!(kb.get(&c, &bad), Err(Error::Parse { .. })));
+        assert_eq!(kb.rebuild_index().unwrap(), 3);
+    }
+
+    #[test]
+    fn hand_edit_is_searchable_without_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "s1");
+        let id = kb.add(&c, note("Lock", "held for writes")).unwrap().meta.id;
+        assert!(kb.search(&c, "quokka", None, 5).unwrap().is_empty());
+        let path = kb.entry_path(&id);
+        fs::write(&path, format!("{}\nquokka\n", fs::read_to_string(&path).unwrap())).unwrap();
+        bump(&path);
+        assert_eq!(kb.search(&c, "quokka", None, 5).unwrap()[0].id, id);
+        // The kb's own marker touch means the next search does not re-index again.
+        assert!(mtime(&kb.marker()).unwrap() >= mtime(&path).unwrap());
+    }
+
+    #[test]
+    fn hand_delete_drops_from_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "s1");
+        let id = kb.add(&c, note("Gone zebra", "zebra")).unwrap().meta.id;
+        kb.add(&c, note("Kept zebra", "zebra")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::remove_file(kb.entry_path(&id)).unwrap();
+        let hits = kb.search(&c, "zebra", None, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].id != id && !read(&dir, "index.md").contains("gone-zebra"));
+    }
+
+    #[test]
+    fn page_goes_stale_when_source_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "s1");
+        let src = kb.add(&c, note("Source zebra", "zebra")).unwrap().meta.id;
+        let p = page(&kb, &c, "Overview", vec![derived(&src)]);
+        let other = page(&kb, &c, "Unrelated", vec![]);
+        assert!(kb.search(&c, "overview", None, 5).unwrap().iter().any(|h| h.id == p));
+        kb.feedback(&c, &src, Verdict::Stale, None).unwrap();
+        assert_eq!(kb.get(&c, &p).unwrap().meta.status, EntryStatus::Stale);
+        assert_eq!(kb.get(&c, &other).unwrap().meta.status, EntryStatus::Active);
+        assert!(kb.search(&c, "overview", None, 5).unwrap().iter().all(|h| h.id != p));
+        assert!(read(&dir, "pages/general/index.md").lines().any(|l| l.contains("(overview.md)") && l.ends_with(" · stale")));
+        assert!(read(&dir, "log.md").contains(&format!("stale [[{p}]] (source {src} stale)")));
+    }
+
+    #[test]
+    fn page_goes_stale_when_source_anchor_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        fs::write(repo.path().join("a.rs"), "1\n").unwrap();
+        git(repo.path(), &["add", "a.rs"]);
+        git(repo.path(), &["commit", "-q", "-m", "init"]);
+        let sha = Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "HEAD"]).output().unwrap();
+        let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+        let kb = open(dir.path());
+        let c = who("pi", "s1");
+        let anchor = Anchor { repo: repo.path().display().to_string(), path: "gone.rs".into(), lines: (1, 1), sha };
+        let src = kb.add(&c, NewEntry { anchors: vec![anchor], ..note("Anchored", "x") }).unwrap().meta.id;
+        let p = page(&kb, &c, "Overview", vec![derived(&src)]);
+        let r = kb.check_anchors(&c).unwrap();
+        assert_eq!(r.stale_pages, std::slice::from_ref(&p));
+        assert_eq!(kb.get(&c, &p).unwrap().meta.status, EntryStatus::Stale);
+    }
+
+    #[test]
+    fn supersedes_expires_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "s1");
+        let src = kb.add(&c, note("Source", "s")).unwrap().meta.id;
+        let old = page(&kb, &c, "Old overview", vec![derived(&src)]);
+        let dependent = page(&kb, &c, "Dependent", vec![derived(&old)]);
+        let sup = Link { kind: LinkType::Supersedes, target: old.clone() };
+        let new = page(&kb, &c, "New overview", vec![sup.clone(), derived(&src)]);
+        assert_eq!(kb.get(&c, &old).unwrap().meta.status, EntryStatus::Expired);
+        assert_eq!(kb.get(&c, &dependent).unwrap().meta.status, EntryStatus::Stale);
+        assert_eq!(kb.get(&c, &new).unwrap().meta.status, EntryStatus::Active);
+        assert!(read(&dir, "log.md").contains(&format!("expire [[{old}]] (superseded by {new})")));
+        let missing = Link { kind: LinkType::Supersedes, target: "pages/general/nope".into() };
+        let before = fs::read_dir(dir.path().join("pages/general")).unwrap().count();
+        assert!(matches!(kb.add(&c, NewEntry { links: vec![missing], ..note("Bad", "x") }), Err(Error::Invalid(_))));
+        assert_eq!(fs::read_dir(dir.path().join("pages/general")).unwrap().count(), before);
     }
 }

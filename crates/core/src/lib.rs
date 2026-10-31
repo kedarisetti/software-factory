@@ -1,5 +1,7 @@
 //! Shared types and plugin traits. Plugins depend on this crate, never on each other.
 
+pub mod untrusted;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -157,6 +159,18 @@ pub enum Error {
     Killed,
     #[error("budget exceeded: {0}")]
     BudgetExceeded(String),
+    /// A gated action needs a human answer; the engine parks the run on this key.
+    #[error("awaiting approval: {0}")]
+    AwaitingApproval(String),
+    /// A human denied a gated action. The engine escalates the run; no retry.
+    #[error("denied: {0}")]
+    Denied(String),
+    /// Untrusted input looks like instructions (SBX-3). The engine escalates the run; no retry.
+    #[error("possible injection: {0}")]
+    Injection(String),
+    /// The policy forbids this (scope not granted, lease expired, fs or network isolation unavailable).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -189,6 +203,159 @@ pub trait Store: Send + Sync {
     fn deliver(&self, key: &str, payload: &serde_json::Value) -> Result<()>;
     /// Read a delivered payload without consuming it.
     fn delivery(&self, key: &str) -> Result<Option<serde_json::Value>>;
+
+    /// Append to the audit log (append-only, hash-chained). The store assigns `seq`, `prev_hash` and
+    /// `hash`. A record whose `key` is already present is not appended again, so a re-run after a
+    /// crash logs an action once; the existing record is returned.
+    fn append_audit(&self, rec: &AuditRecord) -> Result<AuditRecord>;
+    /// Audit records in `seq` order, all runs or one run.
+    fn read_audit(&self, run_id: Option<&str>) -> Result<Vec<AuditRecord>>;
+}
+
+/// Who or what allowed an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    /// The policy needs no approval for this action.
+    Auto,
+    Approved,
+    Denied,
+    /// Stopped by policy (egress not allowlisted, scope not granted, injection detected).
+    Blocked,
+}
+
+/// One audit log row: every action records its run, step, agent and the approval that allowed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    /// Assigned by the store, from 0.
+    pub seq: u64,
+    pub ts: Timestamp,
+    pub run_id: RunId,
+    pub step_id: StepId,
+    pub agent_id: Option<String>,
+    /// Dedupe key (for actions: the effect key plus the decision). Unique across the log.
+    pub key: String,
+    /// `tool`, `egress`, `secret`, or an `ActionKind` name such as `merge_protected`.
+    pub action: String,
+    pub target: String,
+    /// sha256 of the canonical action JSON; an approval is bound to it.
+    pub digest: String,
+    pub decision: Decision,
+    pub approver: Option<String>,
+    pub detail: serde_json::Value,
+    /// Assigned by the store: hash of the previous row ("" for the first) and of this row.
+    pub prev_hash: String,
+    pub hash: String,
+}
+
+impl AuditRecord {
+    /// hex(sha256(prev_hash, seq, ts, run_id, step_id, agent_id, key, action, target, digest,
+    /// decision, approver, detail)), fields separated by NUL. Stores call this; `verify_chain` checks it.
+    pub fn compute_hash(&self) -> String {
+        let mut h = Sha256::new();
+        let parts = [
+            self.prev_hash.clone(),
+            self.seq.to_string(),
+            self.ts.to_string(),
+            self.run_id.clone(),
+            self.step_id.clone(),
+            self.agent_id.clone().unwrap_or_default(),
+            self.key.clone(),
+            self.action.clone(),
+            self.target.clone(),
+            self.digest.clone(),
+            serde_json::to_string(&self.decision).unwrap_or_default(),
+            self.approver.clone().unwrap_or_default(),
+            self.detail.to_string(),
+        ];
+        for p in parts {
+            h.update(p.as_bytes());
+            h.update([0u8]);
+        }
+        hex(&h.finalize())
+    }
+}
+
+/// Checks a full log read with `read_audit(None)`: seqs are 0.., each `prev_hash` links to the row
+/// before, each `hash` matches. Returns the seq of the first bad row.
+pub fn verify_chain(log: &[AuditRecord]) -> std::result::Result<(), u64> {
+    let mut prev = String::new();
+    for (i, r) in log.iter().enumerate() {
+        if r.seq != i as u64 || r.prev_hash != prev || r.hash != r.compute_hash() {
+            return Err(r.seq);
+        }
+        prev = r.hash.clone();
+    }
+    Ok(())
+}
+
+/// What a step wants to do in the world. The gate table maps the kind to a gate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    MergeProtected,
+    Deploy,
+    ExternalMessage,
+    /// New tool, model or connector.
+    NewCapability,
+    DraftPr,
+    Branch,
+    OwnTicketComment,
+    /// Anything else, by name. Gated by default (fail closed).
+    Other(String),
+}
+
+impl ActionKind {
+    pub fn name(&self) -> String {
+        match self {
+            ActionKind::Other(s) => format!("other:{s}"),
+            k => serde_json::to_value(k).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
+        }
+    }
+}
+
+/// A side effect a step asks the engine to perform through a gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Action {
+    pub kind: ActionKind,
+    /// What it acts on: `org/repo#12`, `prod`, `mail:someone@example.com`.
+    pub target: String,
+    /// Everything the approver needs to see; part of the digest.
+    pub detail: serde_json::Value,
+}
+
+impl Action {
+    /// hex(sha256(kind name, target, canonical detail)). serde_json maps keep keys sorted, so the
+    /// same action always gives the same digest.
+    pub fn digest(&self) -> String {
+        let mut h = Sha256::new();
+        for p in [self.kind.name(), self.target.clone(), self.detail.to_string()] {
+            h.update(p.as_bytes());
+            h.update([0u8]);
+        }
+        hex(&h.finalize())
+    }
+}
+
+/// A short-lived credential (SBX-2). `value` never goes into an event, ledger row, audit record or
+/// model context; `Debug` hides it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub scope: String,
+    pub value: String,
+    pub expires_at: Timestamp,
+}
+
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease").field("scope", &self.scope).field("value", &"[REDACTED]").field("expires_at", &self.expires_at).finish()
+    }
+}
+
+/// Issues credentials for a scope, for one run, for at most `ttl_ms` (SBX-2).
+/// `Forbidden` when the scope is unknown or not issuable to this run.
+pub trait Credentials: Send + Sync {
+    fn lease(&self, scope: &str, run_id: &str, ttl_ms: u64) -> Result<Lease>;
 }
 
 /// Knowledge retrieval (RET-1 to RET-4).
@@ -201,10 +368,72 @@ pub trait Retriever {
 pub struct ToolCall {
     pub program: String,
     pub args: Vec<String>,
-    /// Working directory, relative to the sandbox root.
+    /// Working directory, relative to the workspace.
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
     pub stdin: Option<String>,
+    /// Isolated filesystem the call sees (SBX-1): a folder name under the sandbox root, one per run.
+    /// Set by the engine to the run id; a step cannot choose another run's workspace. Empty = root.
+    #[serde(default)]
+    pub workspace: String,
+    /// Hosts the call may reach (SBX-1). Set by the engine from the workflow policy; empty = no network.
+    #[serde(default)]
+    pub egress: Vec<HostRule>,
+    /// Credentials to inject as env vars at the tool layer (SBX-2). The engine resolves them;
+    /// only the reference is ever logged.
+    #[serde(default)]
+    pub secrets: Vec<SecretRef>,
+}
+
+/// One egress allowlist entry: `host` is an exact name or IP, or `*.suffix` for subdomains (not the
+/// bare suffix). `port` `None` = 443 and 80 only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HostRule {
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+impl HostRule {
+    /// Parses `host`, `host:port`, `*.suffix` or `*.suffix:port`.
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        let (host, port) = match s.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => {
+                (h.to_string(), Some(p.parse::<u16>().map_err(|_| Error::Invalid(format!("bad port in {s}")))?))
+            }
+            _ => (s.clone(), None),
+        };
+        let bare = host.strip_prefix("*.").unwrap_or(&host);
+        if bare.is_empty() || bare.contains('*') || !bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            return Err(Error::Invalid(format!("bad host rule {s}")));
+        }
+        Ok(HostRule { host, port })
+    }
+
+    /// Case-insensitive match; a trailing dot on `host` is ignored.
+    pub fn allows(&self, host: &str, port: u16) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let host_ok = match self.host.strip_prefix("*.") {
+            Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(suffix) && host[..host.len() - suffix.len()].ends_with('.'),
+            None => host == self.host,
+        };
+        host_ok && self.port.map_or(port == 443 || port == 80, |p| p == port)
+    }
+}
+
+/// A credential the step asks for by scope; the engine injects the leased value as env var `env`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRef {
+    pub env: String,
+    pub scope: String,
+}
+
+/// One connection attempt seen by the egress proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressAttempt {
+    pub host: String,
+    pub port: u16,
+    pub allowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,6 +444,9 @@ pub struct ToolOutput {
     pub duration_ms: u64,
     /// Output was cut at `Limits::max_output_bytes`.
     pub truncated: bool,
+    /// Every connection the call tried through the egress proxy, allowed or not (SBX-1, audit).
+    #[serde(default)]
+    pub egress: Vec<EgressAttempt>,
 }
 
 /// Per-call resource limits (SBX-4).
@@ -278,5 +510,59 @@ mod tests {
         // The separator keeps ("ab","c") and ("a","bc") apart.
         assert_ne!(idempotency_key("ab", "c"), idempotency_key("a", "bc"));
         assert_eq!(idempotency_key("r", "s").len(), 64);
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+
+    #[test]
+    fn host_rules() {
+        let r = HostRule::parse("api.github.com").unwrap();
+        assert!(r.allows("API.GitHub.com.", 443) && r.allows("api.github.com", 80));
+        assert!(!r.allows("api.github.com", 22) && !r.allows("evil-api.github.com", 443));
+        let w = HostRule::parse("*.example.com:8443").unwrap();
+        assert!(w.allows("a.b.example.com", 8443) && !w.allows("example.com", 8443) && !w.allows("aexample.com", 8443));
+        assert!(!w.allows("a.example.com", 443));
+        assert!(HostRule::parse("127.0.0.1:9").unwrap().allows("127.0.0.1", 9));
+        for bad in ["", "*", "a*.com", "host:port", "ex ample.com", "*."] {
+            assert!(HostRule::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn action_digest_is_stable_and_binds_detail() {
+        let a = Action { kind: ActionKind::Deploy, target: "prod".into(), detail: serde_json::json!({"b": 1, "a": 2}) };
+        let b = Action { detail: serde_json::json!({"a": 2, "b": 1}), ..a.clone() };
+        assert_eq!(a.digest(), b.digest());
+        assert_ne!(a.digest(), Action { target: "staging".into(), ..a.clone() }.digest());
+        assert_eq!(ActionKind::MergeProtected.name(), "merge_protected");
+        assert_eq!(ActionKind::Other("x".into()).name(), "other:x");
+    }
+
+    #[test]
+    fn audit_chain_detects_tampering() {
+        let mut log = Vec::new();
+        let mut prev = String::new();
+        for i in 0..3u64 {
+            let mut r = AuditRecord {
+                seq: i, ts: i, run_id: "r".into(), step_id: "s".into(), agent_id: None, key: format!("k{i}"),
+                action: "tool".into(), target: "sh".into(), digest: String::new(), decision: Decision::Auto,
+                approver: None, detail: serde_json::json!({}), prev_hash: prev.clone(), hash: String::new(),
+            };
+            r.hash = r.compute_hash();
+            prev = r.hash.clone();
+            log.push(r);
+        }
+        assert_eq!(verify_chain(&log), Ok(()));
+        log[1].approver = Some("mallory".into());
+        assert_eq!(verify_chain(&log), Err(1));
+    }
+
+    #[test]
+    fn lease_debug_hides_value() {
+        let l = Lease { scope: "gh".into(), value: "s3cr3t".into(), expires_at: 1 };
+        assert!(!format!("{l:?}").contains("s3cr3t"));
     }
 }

@@ -243,16 +243,16 @@ pub enum ItemStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub item_id: String,
-    /// Connector name: `slack`, `github`, `cli`, `intake-analysis`.
+    /// Configured source name, `cli`, `intake-analysis`.
     pub source: String,
     /// Where it came from, for humans: a permalink, `org/repo#12`, `C024BE91L/1712345678.000100`.
     pub source_ref: String,
-    /// Two events with the same key are one item (TRG-2): Slack event id, GitHub delivery id or
+    /// Two events with the same key are one item (TRG-2): a delivery or event id, or
     /// issue + action, or a content hash for near-duplicates.
     pub dedupe_key: String,
-    /// Who triggered it (Slack user id, GitHub login). Used for permissions and rate limits.
+    /// Who triggered it (user id or login). Used for permissions and rate limits.
     pub actor: String,
-    /// Slack channel id, GitHub `org/repo`. Used by the permission table.
+    /// Channel id or `org/repo`. Used by the permission table.
     pub channel: String,
     /// Workflow to start, once resolved and allowed.
     pub workflow: Option<String>,

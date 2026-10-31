@@ -40,13 +40,23 @@ fn deploy_allowed_for_tickets_never_for_chat() {
 #[test]
 fn chat_rule_allowing_deploy_fails_at_load() {
     let bad = r#"{"deploy_workflows":["deploy-prod"],"rules":[{"source":"slack","channel":"*","workflows":["triage","deploy-prod"]}]}"#;
+    let chat = ["slack".to_string()];
     assert_eq!(
-        PermissionTable::from_json(bad),
+        PermissionTable::from_json_with_chat(bad, &chat),
         Err(ConfigError::ChatDeploy { chat_source: "slack".into(), workflow: "deploy-prod".into() })
     );
     // Source name case does not bypass the check.
-    assert!(PermissionTable::from_json(&bad.replace("\"slack\"", "\"Slack\"")).is_err());
-    assert!(PermissionTable::from_json(&fixture("permissions.json")).is_ok());
+    assert!(PermissionTable::from_json_with_chat(&bad.replace("\"slack\"", "\"Slack\""), &chat).is_err());
+    assert!(PermissionTable::from_json_with_chat(&fixture("permissions.json"), &chat).is_ok());
+    // No name is chat unless the config says so.
+    assert!(PermissionTable::from_json(bad).is_ok());
+}
+
+#[test]
+fn only_configured_sources_are_chat() {
+    let t = PermissionTable::from_json(&fixture("permissions.json")).unwrap();
+    assert!(t.chat_sources.is_empty());
+    assert!(allowed(&t, "slack", "C024BE91L", "anyone", "fix-bug"));
 }
 
 #[test]

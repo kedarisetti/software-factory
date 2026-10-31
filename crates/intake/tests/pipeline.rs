@@ -3,10 +3,15 @@ use std::collections::BTreeMap;
 
 use common::{ev, intake_with};
 use sf_core::ItemStatus;
-use sf_intake::{IntakeConfig, RateLimits};
+use sf_intake::{IntakeConfig, PriorityConfig, RateLimits};
 
 const T0: u64 = 1_700_000_000_000;
 const MIN: u64 = 60_000;
+
+/// No source has a built-in score; this config says what `github` is worth.
+fn based() -> IntakeConfig {
+    IntakeConfig { priority: PriorityConfig { base: BTreeMap::from([("github".to_string(), 10)]), ..Default::default() }, ..Default::default() }
+}
 
 fn all(i: &sf_intake::Intake) -> Vec<sf_core::WorkItem> {
     i.queue().list_items(&[ItemStatus::Queued, ItemStatus::Rejected, ItemStatus::RateLimited], 100).unwrap()
@@ -14,7 +19,7 @@ fn all(i: &sf_intake::Intake) -> Vec<sf_core::WorkItem> {
 
 #[test]
 fn allowed_event_is_queued_with_payload() {
-    let i = intake_with(IntakeConfig::default());
+    let i = intake_with(based());
     let mut e = ev("github", "acme/shop", "octocat", "fix-bug", "Coupon bug\nshipping doubles", "github:acme/shop#42:opened", T0);
     e.labels = vec!["p0".into()];
     let o = i.accept(&e).unwrap();
@@ -23,6 +28,9 @@ fn allowed_event_is_queued_with_payload() {
     assert_eq!(o.item.payload["priority_rules"], serde_json::json!(["p0"]));
     assert_eq!(o.item.payload["untrusted"], true);
     assert_eq!(o.item.priority, 110);
+    // Without a configured base the same event scores only its rules.
+    let plain = intake_with(IntakeConfig::default()).accept(&e).unwrap();
+    assert_eq!(plain.item.priority, 100);
 }
 
 #[test]
@@ -96,7 +104,7 @@ fn per_source_limit() {
 
 #[test]
 fn priority_orders_the_queue() {
-    let i = intake_with(IntakeConfig::default());
+    let i = intake_with(based());
     let mk = |key: &str, text: &str, labels: &[&str], at: u64| {
         let mut e = ev("github", "acme/shop", &format!("a{key}"), "fix-bug", text, key, at);
         e.labels = labels.iter().map(|s| s.to_string()).collect();

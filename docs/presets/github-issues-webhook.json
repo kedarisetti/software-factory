@@ -1,0 +1,27 @@
+{
+  "name": "gh-issues-hook",
+  "kind": "webhook",
+  "chat": false,
+  "verify": {
+    "secret_env": "SF_GH_WEBHOOK_SECRET",
+    "header": "X-Hub-Signature-256",
+    "prefix": "sha256="
+  },
+  "events": {
+    "only": [{ "header:X-GitHub-Event": "issues", "/action": ["opened", "labeled", "reopened"] }],
+    "map": {
+      "id": "{/repository/full_name}#{/issue/number}",
+      "title": "/issue/title",
+      "text": "/issue/body",
+      "actor": "/sender/login",
+      "channel": "/repository/full_name",
+      "labels": "/issue/labels",
+      "url": "/issue/html_url",
+      "dedupe": "{header:X-GitHub-Delivery}"
+    },
+    "workflow": [
+      { "label_prefix": { "prefix": "factory:", "from": "/label/name" } },
+      { "label_prefix": { "prefix": "factory:" } }
+    ]
+  }
+}

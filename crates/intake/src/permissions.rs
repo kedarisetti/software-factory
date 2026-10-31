@@ -9,7 +9,7 @@ use crate::event::IntakeEvent;
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub source: String,
-    /// Exact channel (Slack id, `org/repo`) or `*`.
+    /// Exact channel (as the source's `channel` template yields it) or `*`.
     pub channel: String,
     /// Allowlist of actors; absent = anyone in the channel.
     #[serde(default)]

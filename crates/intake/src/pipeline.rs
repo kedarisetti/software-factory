@@ -45,7 +45,7 @@ fn valid_ref(r: &str) -> bool {
 }
 
 /// The raw value of a reference, if present (pointers only; headers and source are strings).
-fn lookup<'a>(r: &str, ctx: &'a Ctx) -> Option<Value> {
+fn lookup(r: &str, ctx: &Ctx) -> Option<Value> {
     if r == "source" {
         return Some(Value::String(ctx.source.into()));
     }

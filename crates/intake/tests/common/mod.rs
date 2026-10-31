@@ -43,7 +43,8 @@ pub fn fixture(name: &str) -> String {
 }
 
 pub fn table() -> PermissionTable {
-    PermissionTable::from_json(&fixture("permissions.json")).unwrap()
+    // Chat-ness comes from the source config, never from a name: the loader passes it in.
+    PermissionTable::from_json_with_chat(&fixture("permissions.json"), &["slack".to_string()]).unwrap()
 }
 
 pub fn intake_with(cfg: IntakeConfig) -> Intake {

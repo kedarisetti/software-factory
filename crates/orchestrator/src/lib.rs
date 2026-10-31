@@ -330,7 +330,7 @@ impl StepCtx {
         Ok(v)
     }
 
-    /// Wrap content from tickets, Slack, email or the web (SBX-3). If the scan finds instruction-like
+    /// Wrap content from tickets, chat, email or the web (SBX-3). If the scan finds instruction-like
     /// text and no human has waived this exact content, audit it, escalate the run and fail.
     pub fn untrusted(&mut self, source: &str, content: &str) -> Result<Untrusted> {
         let u = Untrusted::new(source, content);

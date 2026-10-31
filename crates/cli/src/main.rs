@@ -292,6 +292,34 @@ fn run_notes(events: &[sf_core::Event], state: RunState) -> (Value, Value) {
     (pending, escalation)
 }
 
+/// Recovers and runs everything due until nothing progresses. With `wait_soon`, also waits for runs
+/// whose retry or approval timer fires within 10 s (`sf run`); the daemon passes false and picks them up next tick.
+pub(crate) fn drive_runs(engine: &Engine, store: &dyn Store, wait_soon: bool) -> Result<Vec<String>, String> {
+    let e = |e: Error| e.to_string();
+    let mut ticked = engine.recover().map_err(e)?;
+    loop {
+        let ids = engine.run_due().map_err(e)?;
+        let mut progressed = !ids.is_empty();
+        ticked.extend(ids);
+        let ids = engine.recover().map_err(e)?;
+        progressed |= !ids.is_empty();
+        ticked.extend(ids);
+        if progressed {
+            continue;
+        }
+        if !wait_soon {
+            break;
+        }
+        let now = sf_core::Clock::now(&SystemClock);
+        let runs = store.list_runs(&[RunState::AwaitingApproval, RunState::WaitingOnEvent, RunState::RetryingStep]).map_err(e)?;
+        if !runs.iter().any(|r| matches!(r.wake, Some(Wake::At(t)) if t <= now + 10_000)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(ticked)
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     // Busybox style: this binary is also the in-sandbox egress shim.
@@ -415,29 +443,7 @@ fn main() {
             let id = ex(engine.start_run(&arg(1), "cli", budget_tokens, budget_usd));
             json!({"run_id": id})
         }
-        "run" => {
-            let mut ticked = Vec::new();
-            ticked.extend(ex(engine.recover()));
-            loop {
-                let ids = ex(engine.run_due());
-                let progressed = !ids.is_empty();
-                ticked.extend(ids);
-                let ids = ex(engine.recover());
-                let progressed = progressed || !ids.is_empty();
-                ticked.extend(ids);
-                if progressed {
-                    continue;
-                }
-                let now = sf_core::Clock::now(&SystemClock);
-                let runs = ex(store.list_runs(&[RunState::AwaitingApproval, RunState::WaitingOnEvent, RunState::RetryingStep]));
-                let soon = runs.iter().any(|r| matches!(r.wake, Some(Wake::At(t)) if t <= now + 10_000));
-                if !soon {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            json!({"ticked": ticked})
-        }
+        "run" => json!({"ticked": ex(drive_runs(&engine, &*store, true))}),
         "status" => {
             let id = arg(1);
             let run = ex(store.get_run(&id)).unwrap_or_else(|| die("run not found"));

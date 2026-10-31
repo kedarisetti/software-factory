@@ -1,6 +1,6 @@
 //! Generic signed webhook (TRG-1): HMAC-SHA256 check described in the config, optional replay
-//! window and challenge echo, then the source's `Pipeline`. No vendor is built in; Slack, GitHub and
-//! others are config presets (docs/intake.md).
+//! window and challenge echo, then the source's `Pipeline`. No vendor is built in; vendors are
+//! config presets (docs/intake.md).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,7 +31,7 @@ pub struct Verify {
     pub max_skew_s: Option<i64>,
 }
 
-/// Answer `reply` (a reference) as text when `when` matches, e.g. Slack's url_verification.
+/// Answer `reply` (a reference) as text when `when` matches, e.g. a URL-verification handshake.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Challenge {
@@ -85,7 +85,7 @@ impl Verify {
         let mut out = Vec::new();
         let mut rest = spec.as_str();
         while let Some(o) = rest.find('{') {
-            out.extend_from_slice(rest[..o].as_bytes());
+            out.extend_from_slice(&rest.as_bytes()[..o]);
             let c = rest[o..].find('}').map(|c| c + o).ok_or_else(|| ConnectorError::Malformed("bad signed template".into()))?;
             match &rest[o + 1..c] {
                 "body" => out.extend_from_slice(body),
@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn body_signature_like_github() {
+    fn body_signature_with_prefix() {
         let w = hook(json!({"secret_env": "S", "header": "X-Hub-Signature-256", "prefix": "sha256="}), None);
         let body = br#"{"id": 1, "t": "hello"}"#;
         let good = Headers::from_pairs(&[("X-Hub-Signature-256", &format!("sha256={}", sign(body))), ("X-Delivery", "d1")]);
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn templated_signature_replay_window_and_challenge_like_slack() {
+    fn templated_signature_replay_window_and_challenge() {
         let w = hook(
             json!({"secret_env": "S", "header": "X-Sig", "prefix": "v0=", "signed": "v0:{header:X-Ts}:{body}", "timestamp_header": "X-Ts"}),
             Some(json!({"when": {"/type": "url_verification"}, "reply": "/challenge"})),

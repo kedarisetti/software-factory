@@ -52,6 +52,7 @@ fn kind_str(k: EntryKind) -> &'static str {
         EntryKind::Learning => "learning",
         EntryKind::Glossary => "glossary",
         EntryKind::Convention => "convention",
+        EntryKind::Page => "page",
     }
 }
 
@@ -231,6 +232,7 @@ impl Kb {
             outcome: None,
             count: 1,
             source_runs: vec![],
+            key: None,
             helped: 0,
             misled: 0,
         };
@@ -301,6 +303,7 @@ impl Kb {
                         outcome: rec.outcome,
                         count: 1,
                         source_runs: vec![caller.session.clone()],
+                        key: None,
                         helped: 0,
                         misled: 0,
                     },
@@ -340,7 +343,7 @@ impl Kb {
     fn do_check_anchors(&self) -> Result<AnchorReport> {
         let _lock = self.lock()?;
         let now = (self.now)();
-        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![] };
+        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![], dangling_links: vec![] };
         for mut e in self.load_all()? {
             if e.meta.anchors.is_empty() {
                 continue;
@@ -411,6 +414,9 @@ impl Knowledge for Kb {
         let r = self.load(id);
         self.log(caller, "get", json!({"id": id}), &r, |e| json!({"id": e.meta.id}));
         r
+    }
+    fn list(&self, _caller: &Caller, _path: &str) -> Result<Listing> {
+        todo!("builder: wiki-store")
     }
     fn add(&self, caller: &Caller, entry: NewEntry) -> Result<Entry> {
         let args = json!({"title": entry.title, "kind": entry.kind, "tags": entry.tags, "task_class": entry.task_class});

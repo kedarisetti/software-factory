@@ -1,10 +1,15 @@
 //! Knowledge service core (KIF-1). Runs without the orchestrator; any agent harness can use it.
 //!
-//! Source of truth is plain files (KIF-2): `<root>/entries/<id>.md`, YAML frontmatter + Markdown body.
+//! Source of truth is plain files (KIF-2) laid out as a wiki (WIKI-1): `<root>/<kind>/<topic>/<slug>.md`,
+//! YAML frontmatter + Markdown body + a generated links footer (WIKI-4). An entry's ID is that path
+//! without `.md`, e.g. `learnings/fix-ci/pin-the-rust-toolchain`.
+//!
+//! Generated from the entries, never hand-edited: `index.md` at the root and in every folder (WIKI-2),
+//! `log.md` (WIKI-3). Written once, then human-owned: `AGENTS.md` (WIKI-6).
 //! Everything under `<root>/.kb/` is cache or log and can be deleted:
 //! `.kb/index/` (BM25, see [`Index`]), `.kb/lock` (writer lock), `.kb/calls.jsonl` (call log, KIF-5).
 //!
-//! The six operations (KIF-4) are the [`Knowledge`] trait. [`Kb`] is the one implementation;
+//! The seven operations (KIF-4) are the [`Knowledge`] trait. [`Kb`] is the one implementation;
 //! the CLI, the MCP server and Rust callers all go through it (KIF-3).
 
 use serde::{Deserialize, Serialize};
@@ -14,13 +19,23 @@ pub use kb::Kb;
 
 /// Contract version (KIF-8). Bump on any breaking change to the types or operations below.
 /// Clients send the version they expect; a mismatch is `Error::Version`, never a silent best effort.
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// Unix time in milliseconds.
 pub type Timestamp = u64;
 
-/// Entry IDs are lowercase `[a-z0-9-]`, at most 80 chars, and double as the file stem.
+/// Entry IDs are the entry's path relative to the root, without `.md` (WIKI-1):
+/// 2 or 3 `/`-separated segments of `[a-z0-9-]`, at most 160 chars, e.g. `notes/retrieval/writer-lock`.
 pub type EntryId = String;
+
+/// True if `id` is a well-formed entry ID. Front doors and the store reject anything else
+/// (this is also the path-traversal guard).
+pub fn valid_id(id: &str) -> bool {
+    let segs: Vec<&str> = id.split('/').collect();
+    id.len() <= 160
+        && (2..=3).contains(&segs.len())
+        && segs.iter().all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+}
 
 /// Who is calling (KIF-5). Recorded on every operation and in every entry they write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +54,21 @@ pub enum EntryKind {
     Learning,
     Glossary,
     Convention,
+    /// Synthesis page summarising a topic across entries (WIKI-5).
+    Page,
+}
+
+impl EntryKind {
+    /// Top-level folder for this kind (WIKI-1).
+    pub fn dir(self) -> &'static str {
+        match self {
+            EntryKind::Note => "notes",
+            EntryKind::Learning => "learnings",
+            EntryKind::Glossary => "glossary",
+            EntryKind::Convention => "conventions",
+            EntryKind::Page => "pages",
+        }
+    }
 }
 
 /// Typed link (KNO-3).
@@ -121,6 +151,9 @@ pub struct Meta {
     /// Learnings only: every run or session that reported it (LRN-3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_runs: Vec<String>,
+    /// Learnings only: normalized finding key used to merge repeats (LRN-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// Feedback tallies, updated by `feedback`.
     #[serde(default)]
     pub helped: u32,
@@ -216,11 +249,49 @@ pub struct AnchorProblem {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DanglingLink {
+    pub from: EntryId,
+    pub to: EntryId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnchorReport {
     pub checked: usize,
     pub broken: Vec<AnchorProblem>,
     /// Entries that were BrokenAnchor and now resolve again.
     pub repaired: Vec<EntryId>,
+    /// Links whose target does not exist (WIKI-7).
+    #[serde(default)]
+    pub dangling_links: Vec<DanglingLink>,
+}
+
+/// One folder of the wiki, as returned by `list` (WIKI-2, RET-7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Listing {
+    /// The folder listed, relative to the root ("" for the root).
+    pub path: String,
+    pub dirs: Vec<DirItem>,
+    pub entries: Vec<ListItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirItem {
+    /// Path relative to the root, e.g. `learnings/fix-ci`.
+    pub path: String,
+    /// Entries anywhere below it.
+    pub entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListItem {
+    pub id: EntryId,
+    pub title: String,
+    pub kind: EntryKind,
+    pub status: EntryStatus,
+    /// First sentence or line of the body, at most ~120 chars.
+    pub summary: String,
+    pub count: u32,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -255,19 +326,25 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The six operations (KIF-4). Every call takes the `Caller` and is logged (KIF-5).
+/// The seven operations (KIF-4). Every call takes the `Caller` and is logged (KIF-5).
+/// Retrieval flow (RET-7): `search` first with the task's own wording, then `get` or `list`
+/// on the narrowed candidates.
 pub trait Knowledge {
     /// BM25 search (RET-1). Only `Active`, unexpired entries are returned (RET-2);
     /// `task_class` keeps entries of that class plus class-less ones (RET-3).
     /// Logged with the query, returned IDs and scores (RET-4).
     fn search(&self, caller: &Caller, query: &str, task_class: Option<&str>, top_k: usize) -> Result<Vec<Hit>>;
     fn get(&self, caller: &Caller, id: &str) -> Result<Entry>;
+    /// Browse one folder (`""` for the root): subfolders with entry counts, and the entries directly
+    /// in it, including inactive ones (their status is shown). `NotFound` if the folder does not exist.
+    fn list(&self, caller: &Caller, path: &str) -> Result<Listing>;
     fn add(&self, caller: &Caller, entry: NewEntry) -> Result<Entry>;
     /// LRN-1 to LRN-4.
     fn learn(&self, caller: &Caller, record: LearningRecord) -> Result<Learned>;
     /// FBK-2 for knowledge entries: bumps tallies; `Wrong` or `Stale` expires the entry.
     fn feedback(&self, caller: &Caller, id: &str, verdict: Verdict, note: Option<&str>) -> Result<Entry>;
     /// KNO-2: verify every anchor; mark broken ones `BrokenAnchor`, restore repaired ones to `Active`.
+    /// Also reports dangling links (WIKI-7).
     fn check_anchors(&self, caller: &Caller) -> Result<AnchorReport>;
 }
 
@@ -284,19 +361,37 @@ pub trait Index: Send + Sync {
     fn search(&self, query: &str, task_class: Option<&str>, top_k: usize) -> Result<Vec<(EntryId, f32)>>;
 }
 
-/// Parse an entry file: `---\n<yaml>\n---\n<body>`.
+/// Start of the generated links footer (WIKI-4). Everything from here to the end of file is regenerated.
+pub const LINKS_MARKER: &str = "<!-- kb:links (generated from frontmatter; edits here are overwritten) -->";
+
+/// Parse an entry file: `---\n<yaml>\n---\n<body>[<links footer>]`. The footer is dropped;
+/// links live in the frontmatter.
 pub fn parse_entry(text: &str) -> std::result::Result<Entry, String> {
     let rest = text.strip_prefix("---\n").ok_or("missing opening ---")?;
     let end = rest.find("\n---\n").or_else(|| rest.strip_suffix("\n---").map(|r| r.len())).ok_or("missing closing ---")?;
     let meta: Meta = serde_yaml::from_str(&rest[..end]).map_err(|e| e.to_string())?;
-    let body = rest[end..].strip_prefix("\n---").unwrap_or("").trim_start_matches('\n').to_string();
-    Ok(Entry { meta, body })
+    let mut body = rest[end..].strip_prefix("\n---").unwrap_or("").trim_start_matches('\n');
+    if let Some(i) = body.find(LINKS_MARKER) {
+        body = body[..i].strip_suffix("\n\n").unwrap_or(&body[..i]);
+    }
+    Ok(Entry { meta, body: body.to_string() })
 }
 
-/// Render an entry file. `parse_entry(&render_entry(e)) == e` for any body.
+/// Render an entry file, with a `[[wikilink]]` footer when it has links (WIKI-4).
+/// `parse_entry(&render_entry(e)) == e` for any body that does not contain `LINKS_MARKER`.
 pub fn render_entry(entry: &Entry) -> String {
     let yaml = serde_yaml::to_string(&entry.meta).expect("Meta always serializes");
-    format!("---\n{yaml}---\n\n{}", entry.body)
+    let mut out = format!("---\n{yaml}---\n\n{}", entry.body);
+    if !entry.meta.links.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(LINKS_MARKER);
+        out.push_str("\n## Links\n\n");
+        for l in &entry.meta.links {
+            let kind = serde_yaml::to_string(&l.kind).expect("LinkType serializes");
+            out.push_str(&format!("- {}: [[{}]]\n", kind.trim(), l.target));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -306,12 +401,12 @@ mod tests {
     fn sample() -> Entry {
         Entry {
             meta: Meta {
-                id: "learning-retry-ci-3f2a".into(),
+                id: "learnings/fix-ci/retry-flaky-ci-once".into(),
                 kind: EntryKind::Learning,
                 title: "Re-run flaky CI once before escalating".into(),
                 tags: vec!["ci".into()],
                 task_class: Some("fix-ci".into()),
-                links: vec![Link { kind: LinkType::DerivedFrom, target: "note-ci".into() }],
+                links: vec![Link { kind: LinkType::DerivedFrom, target: "notes/ci/flaky-jobs".into() }],
                 anchors: vec![Anchor { repo: "factory".into(), path: "a.rs".into(), lines: (1, 3), sha: "abc".into() }],
                 source: "run:r1".into(),
                 author: Caller { agent: "pi".into(), session: "s1".into() },
@@ -322,6 +417,7 @@ mod tests {
                 outcome: Some(Outcome::Succeeded),
                 count: 2,
                 source_runs: vec!["r1".into(), "r2".into()],
+                key: Some("k".into()),
                 helped: 0,
                 misled: 0,
             },
@@ -333,8 +429,18 @@ mod tests {
     fn entry_file_round_trips() {
         let e = sample();
         let text = render_entry(&e);
-        assert!(text.starts_with("---\nid: learning-retry-ci-3f2a\n"));
+        assert!(text.starts_with("---\nid: learnings/fix-ci/retry-flaky-ci-once\n"));
+        assert!(text.ends_with("- derived-from: [[notes/ci/flaky-jobs]]\n"), "{text}");
         assert_eq!(parse_entry(&text).unwrap(), e);
+    }
+
+    #[test]
+    fn ids_are_paths() {
+        assert!(valid_id("learnings/fix-ci/pin-the-toolchain"));
+        assert!(valid_id("glossary/idempotency-key"));
+        for bad in ["notes", "notes/../x", "/notes/a", "notes/a/", "Notes/a", "a/b/c/d", "notes/a.md"] {
+            assert!(!valid_id(bad), "{bad}");
+        }
     }
 }
 

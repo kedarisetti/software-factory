@@ -10,7 +10,7 @@ cargo build -q --release -p sf-kb-cli --manifest-path "$repo/Cargo.toml"
 finding="Pin the rust toolchain in rust-toolchain.toml so CI and local builds match"
 
 cd "$work"
-pi --model "${PI_MODEL:-gemma4-12b-qat:16k}" -e "$repo/adapters/pi/sf-kb.ts" -p \
+pi --model "${PI_MODEL:-gemma4-12b-qat:16k}" -e "$repo/adapters/pi/sf-kb.ts" -p </dev/null \
   "Call kb_learn once with task_class \"fix-ci\", outcome \"succeeded\", worked: [\"$finding\"]. Then call kb_search with query \"rust toolchain\" and task_class \"fix-ci\"."
 
 cat > mcp.json <<JSON

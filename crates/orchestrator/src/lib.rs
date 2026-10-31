@@ -1,7 +1,13 @@
 //! Durable run engine (DUR-1..DUR-6, SBX-4 budget and kill switch). See docs/spec.md.
 //! Depends only on sf-core; talks to storage, the sandbox and time through its traits.
 
+mod audit;
+pub mod credentials;
+mod exec;
 pub mod memory;
+pub mod policy;
+
+pub use policy::{Gate, Policy};
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -10,9 +16,13 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::{json, Value};
 use sf_core::{
-    effect_key, idempotency_key, Clock, Commit, Error, Event, EventKind, KillSwitch, Limits, Result, Run,
-    RunId, RunState, Sandbox, Step, StepStatus, Store, Timestamp, ToolCall, ToolOutput, Wake,
+    effect_key, idempotency_key, Action, Clock, Commit, Credentials, Decision, Error, Event, EventKind, KillSwitch,
+    Limits, Result, Run, RunId, RunState, Sandbox, Step, StepStatus, Store, Timestamp, ToolCall, ToolOutput, Wake,
 };
+use sf_core::untrusted::{scan, Untrusted};
+
+use crate::audit::Auditor;
+use crate::exec::{workspace_name, ToolRun};
 
 /// Outcome of one step attempt.
 pub enum StepResult {
@@ -24,6 +34,14 @@ pub enum StepResult {
     Park(Wake),
     /// Attempt failed; retried alone with backoff (DUR-4).
     Fail(String),
+    /// Escalate to a human at once, no retry (denied action, injection, policy breach).
+    Escalate(String),
+}
+
+impl From<Error> for StepResult {
+    fn from(e: Error) -> Self {
+        StepResult::Fail(e.to_string())
+    }
 }
 
 type StepFn = dyn Fn(&mut StepCtx) -> StepResult + Send + Sync;
@@ -35,17 +53,24 @@ pub struct StepDef {
     pub max_attempts: u32,
     pub backoff_base_ms: u64,
     pub backoff_max_ms: u64,
+    /// Agent that performs the step; recorded on the step row and on audit records.
+    pub agent: Option<String>,
     pub run: Arc<StepFn>,
 }
 
 impl StepDef {
     /// Defaults: 3 attempts, 1s base backoff, 60s cap.
     pub fn new(id: &str, run: impl Fn(&mut StepCtx) -> StepResult + Send + Sync + 'static) -> Self {
-        StepDef { id: id.into(), max_attempts: 3, backoff_base_ms: 1_000, backoff_max_ms: 60_000, run: Arc::new(run) }
+        StepDef { id: id.into(), max_attempts: 3, backoff_base_ms: 1_000, backoff_max_ms: 60_000, agent: None, run: Arc::new(run) }
     }
 
     pub fn retries(mut self, max_attempts: u32, base_ms: u64, max_ms: u64) -> Self {
         (self.max_attempts, self.backoff_base_ms, self.backoff_max_ms) = (max_attempts, base_ms, max_ms);
+        self
+    }
+
+    pub fn agent(mut self, agent: &str) -> Self {
+        self.agent = Some(agent.into());
         self
     }
 
@@ -63,6 +88,10 @@ pub trait Workflow: Send + Sync {
     fn id(&self) -> &str;
     fn version(&self) -> u32;
     fn steps(&self) -> Vec<StepDef>;
+    /// Egress, credential scopes and gate overrides for runs of this workflow (SBX-1, SBX-2).
+    fn policy(&self) -> Policy {
+        Policy::default()
+    }
 }
 
 /// A workflow built from a fixed step list.
@@ -70,11 +99,16 @@ pub struct StaticWorkflow {
     id: String,
     version: u32,
     steps: Vec<StepDef>,
+    policy: Policy,
 }
 
 impl StaticWorkflow {
     pub fn new(id: &str, version: u32, steps: Vec<StepDef>) -> Arc<Self> {
-        Arc::new(StaticWorkflow { id: id.into(), version, steps })
+        Arc::new(StaticWorkflow { id: id.into(), version, steps, policy: Policy::default() })
+    }
+
+    pub fn with_policy(self: Arc<Self>, policy: Policy) -> Arc<Self> {
+        Arc::new(StaticWorkflow { id: self.id.clone(), version: self.version, steps: self.steps.clone(), policy })
     }
 }
 
@@ -87,6 +121,9 @@ impl Workflow for StaticWorkflow {
     }
     fn steps(&self) -> Vec<StepDef> {
         self.steps.clone()
+    }
+    fn policy(&self) -> Policy {
+        self.policy.clone()
     }
 }
 
@@ -126,6 +163,12 @@ pub struct StepCtx {
     store: Arc<dyn Store>,
     sandbox: Arc<dyn Sandbox>,
     kill: KillSwitch,
+    policy: Policy,
+    clock: Arc<dyn Clock>,
+    creds: Option<Arc<dyn Credentials>>,
+    audit: Auditor,
+    park: Option<Park>,
+    escalation: Option<Escalation>,
     step_key: String,
     n: u32,
     events: Vec<(EventKind, Value)>,
@@ -134,6 +177,18 @@ pub struct StepCtx {
     budget_tokens: u64,
     budget_usd: u64,
     over_budget: bool,
+}
+
+/// A gated action waiting for a human: the approval key and what is to be approved.
+struct Park {
+    key: String,
+    action: Action,
+}
+
+/// Why the step must escalate at once, and the waiver keys a human can deliver to let it pass.
+struct Escalation {
+    reason: String,
+    waives: Vec<String>,
 }
 
 impl StepCtx {
@@ -167,17 +222,103 @@ impl StepCtx {
     }
 
     /// Run a sandboxed tool call through the ledger, honouring the engine's kill switch (SBX-4).
+    /// The engine sets workspace and egress from the run and policy (SBX-1), leases `call.secrets`
+    /// within the policy's scopes (SBX-2), audits the call and redacts leased values from the result.
     pub fn tool(&mut self, call: &ToolCall, limits: &Limits) -> Result<ToolOutput> {
-        let (sandbox, kill, c, l) = (self.sandbox.clone(), self.kill.clone(), call.clone(), *limits);
-        let (v, fresh) = self.guarded(move |_key| {
-            let out = sandbox.run(&c, &l, &kill)?;
-            serde_json::to_value(out).map_err(|e| Error::Invalid(e.to_string()))
-        })?;
+        let mut c = call.clone();
+        c.workspace = workspace_name(&self.run_id);
+        c.egress = self.policy.egress.clone();
+        let run = ToolRun {
+            sandbox: self.sandbox.clone(),
+            kill: self.kill.clone(),
+            creds: self.creds.clone(),
+            clock: self.clock.clone(),
+            audit: self.audit.clone(),
+            scopes: self.policy.scopes.clone(),
+            ttl_ms: self.policy.lease_ttl_ms,
+        };
+        let l = *limits;
+        let (v, fresh) = self.guarded(move |key| run.run(key, c, &l))?;
         if fresh {
             self.tool_call(json!({"program": call.program, "args": call.args}));
             self.tool_result(v.clone());
         }
         serde_json::from_value(v).map_err(|e| Error::Invalid(e.to_string()))
+    }
+
+    /// Side effect behind the approval gate (GOV). Shares the effect counter with `effect`/`tool`.
+    /// Auto kinds run at once. Human kinds park until `Engine::approve` delivers a digest that
+    /// matches this exact action; `f` then runs once through the ledger. A changed action needs a
+    /// new approval. A denial escalates the run.
+    pub fn action(&mut self, action: &Action, f: impl FnOnce(&str) -> Result<Value>) -> Result<Value> {
+        let key = effect_key(&self.step_key, self.n);
+        if self.store.effect_result(&key)?.is_some() {
+            return self.run_action(action, f);
+        }
+        let digest = action.digest();
+        let (name, detail) = (action.kind.name(), action.detail.clone());
+        if self.policy.gate(&action.kind) == Gate::Auto {
+            self.audit.record(format!("{key}:auto"), &name, &action.target, &digest, Decision::Auto, None, detail)?;
+            return self.run_action(action, f);
+        }
+        let akey = format!("approval:{}:{}:{}:{}", self.run_id, self.step_id, self.n, &digest[..16]);
+        let Some(d) = self.store.delivery(&akey)? else {
+            self.n += 1;
+            self.park = Some(Park { key: akey.clone(), action: action.clone() });
+            return Err(Error::AwaitingApproval(akey));
+        };
+        let by = d.get("by").and_then(Value::as_str).unwrap_or("").to_string();
+        match d.get("approved").and_then(Value::as_bool) {
+            Some(true) => {
+                if d.get("digest").and_then(Value::as_str) != Some(digest.as_str()) {
+                    return Err(Error::Forbidden("approval does not match this action".into()));
+                }
+                let by = Some(by.as_str()).filter(|b| !b.is_empty());
+                self.audit.record(format!("{key}:approved"), &name, &action.target, &digest, Decision::Approved, by, detail)?;
+                self.run_action(action, f)
+            }
+            Some(false) => {
+                let reason = d.get("reason").and_then(Value::as_str).unwrap_or("denied").to_string();
+                let detail = json!({"reason": reason, "action": detail});
+                self.audit.record(format!("{key}:denied"), &name, &action.target, &digest, Decision::Denied, Some(&by), detail)?;
+                self.escalation = Some(Escalation { reason: format!("denied: {reason}"), waives: vec![] });
+                Err(Error::Denied(reason))
+            }
+            None => Err(Error::Forbidden("malformed approval delivery".into())),
+        }
+    }
+
+    fn run_action(&mut self, action: &Action, f: impl FnOnce(&str) -> Result<Value>) -> Result<Value> {
+        let (v, fresh) = self.guarded(f)?;
+        if fresh {
+            self.tool_result(json!({"action": action.kind.name(), "target": action.target, "result": v}));
+        }
+        Ok(v)
+    }
+
+    /// Wrap content from tickets, Slack, email or the web (SBX-3). If the scan finds instruction-like
+    /// text and no human has waived this exact content, audit it, escalate the run and fail.
+    pub fn untrusted(&mut self, source: &str, content: &str) -> Result<Untrusted> {
+        let u = Untrusted::new(source, content);
+        if !self.policy.scan_untrusted {
+            return Ok(u);
+        }
+        let findings = scan(&u.content);
+        let digest = u.digest();
+        let waive = format!("waive:{}:{digest}", self.run_id);
+        if findings.is_empty() || self.store.delivery(&waive)?.is_some() {
+            return Ok(u);
+        }
+        let rules = findings.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>().join(", ");
+        let detail = json!({"findings": findings, "waive": waive});
+        let key = format!("{}:injection:{digest}", self.step_key);
+        self.audit.record(key, "injection", source, &digest, Decision::Blocked, None, detail)?;
+        let reason = format!("possible injection in {source}: {rules}");
+        match &mut self.escalation {
+            Some(e) => e.waives.push(waive),
+            None => self.escalation = Some(Escalation { reason, waives: vec![waive] }),
+        }
+        Err(Error::Injection(rules))
     }
 
     /// Add to the run's spend. Returns true once over budget; the engine then parks the run for
@@ -212,11 +353,18 @@ pub struct Engine {
     registry: Registry,
     kill: KillSwitch,
     counter: AtomicU64,
+    creds: Option<Arc<dyn Credentials>>,
 }
 
 impl Engine {
     pub fn new(store: Arc<dyn Store>, sandbox: Arc<dyn Sandbox>, clock: Arc<dyn Clock>, registry: Registry) -> Self {
-        Engine { store, sandbox, clock, registry, kill: KillSwitch::new(), counter: AtomicU64::new(0) }
+        Engine { store, sandbox, clock, registry, kill: KillSwitch::new(), counter: AtomicU64::new(0), creds: None }
+    }
+
+    /// Credential issuer for `ToolCall::secrets` (SBX-2).
+    pub fn with_credentials(mut self, creds: Arc<dyn Credentials>) -> Self {
+        self.creds = Some(creds);
+        self
     }
 
     pub fn kill_switch(&self) -> KillSwitch {
@@ -273,10 +421,16 @@ impl Engine {
             self.commit(&run, None, &mut seq, evs)?;
             return Ok(run.state);
         };
-        let defs = wf.steps();
+        let (defs, policy) = (wf.steps(), wf.policy());
         let mut steps: HashMap<String, Step> =
             self.store.get_steps(run_id)?.into_iter().map(|s| (s.step_id.clone(), s)).collect();
         let mut wake = run.wake.take();
+        if self.budget_denied(&wake)? {
+            run.state = RunState::Escalated;
+            let evs = vec![state_event("", "escalated: budget denied", json!({}))];
+            self.commit(&run, None, &mut seq, evs)?;
+            return Ok(run.state);
+        }
         loop {
             if self.kill.is_tripped() {
                 return Ok(run.state); // stays resumable (SBX-4)
@@ -308,6 +462,12 @@ impl Engine {
                 store: self.store.clone(),
                 sandbox: self.sandbox.clone(),
                 kill: self.kill.clone(),
+                policy: policy.clone(),
+                clock: self.clock.clone(),
+                creds: self.creds.clone(),
+                audit: self.auditor(run_id, &def.id, def.agent.clone()),
+                park: None,
+                escalation: None,
                 step_key: step_key.clone(),
                 n: 0,
                 events: vec![],
@@ -328,7 +488,7 @@ impl Engine {
             let mut step = Step {
                 step_id: def.id.clone(),
                 run_id: run_id.into(),
-                agent_id: None,
+                agent_id: def.agent.clone(),
                 model_id: None,
                 attempt,
                 status: StepStatus::Completed,
@@ -337,6 +497,11 @@ impl Engine {
                 error: None,
             };
             let mut done = false;
+            let (park, esc) = (ctx.park.take(), ctx.escalation.take());
+            let res = match res {
+                StepResult::Fail(e) if park.is_none() && esc.is_some() => StepResult::Escalate(e),
+                r => r,
+            };
             match res {
                 StepResult::Done(v) => {
                     step.output = Some(v);
@@ -358,6 +523,26 @@ impl Engine {
                     };
                     evs.push(state_event(&def.id, "parked", json!({"wake": w})));
                     run.wake = Some(w);
+                    done = true;
+                }
+                StepResult::Fail(_) if park.is_some() => {
+                    let p = park.expect("checked");
+                    let a = &p.action;
+                    let action = json!({"kind": a.kind, "target": a.target, "detail": a.detail, "digest": a.digest()});
+                    step.status = StepStatus::Parked;
+                    run.state = RunState::AwaitingApproval;
+                    let w = Wake::Event(p.key);
+                    evs.push(state_event(&def.id, "parked", json!({"wake": w, "action": action})));
+                    run.wake = Some(w);
+                    done = true;
+                }
+                StepResult::Escalate(e) => {
+                    step.status = StepStatus::Failed;
+                    step.error = Some(e.clone());
+                    evs.push((def.id.clone(), EventKind::Error, json!({"error": e, "attempt": attempt})));
+                    let (reason, waive) = esc.map_or((e, vec![]), |x| (x.reason, x.waives));
+                    run.state = RunState::Escalated;
+                    evs.push(state_event(&def.id, "escalated", json!({"reason": reason, "waive": waive})));
                     done = true;
                 }
                 StepResult::Fail(e) => {
@@ -394,27 +579,47 @@ impl Engine {
         self.tick_due(&[RunState::AwaitingApproval, RunState::WaitingOnEvent, RunState::RetryingStep])
     }
 
-    /// Deliver the approval the run is awaiting. The next `run_due`/`tick` resumes it.
-    pub fn approve(&self, run_id: &str) -> Result<()> {
-        let run = self.load(run_id)?;
-        let Some(Wake::Event(key)) = run.wake.clone().filter(|_| run.state == RunState::AwaitingApproval) else {
-            return Err(Error::Invalid(format!("run {run_id} is not awaiting approval")));
-        };
-        self.store.deliver(&key, &json!({"approved": true}))?;
-        let ev = (String::new(), EventKind::Approval, json!({"key": key}));
-        self.commit(&run, None, &mut self.next_seq(run_id)?, vec![ev])
+    /// A named human approves what the run is parked on. For an action park the delivery carries
+    /// the digest of the parked action, so the approval covers exactly that action. Audited.
+    pub fn approve(&self, run_id: &str, approver: &str) -> Result<()> {
+        self.answer(run_id, approver, true, "")
     }
 
-    /// Human resumes an escalated run; the failed step gets a fresh retry budget.
-    pub fn resume_escalated(&self, run_id: &str) -> Result<()> {
+    /// A named human denies what the run is parked on. The parked step re-runs and gets `Denied`;
+    /// a denied budget park escalates the run.
+    pub fn deny(&self, run_id: &str, approver: &str, reason: &str) -> Result<()> {
+        self.answer(run_id, approver, false, reason)
+    }
+
+    /// Deliver an external event (CI result, reply). Approvals, budget answers and waivers need a
+    /// named human through `approve`, `deny` or `resume_escalated`, so those keys are refused.
+    pub fn deliver(&self, key: &str, payload: &Value) -> Result<()> {
+        if ["approval:", "budget:", "waive:"].iter().any(|p| key.starts_with(p)) {
+            return Err(Error::Forbidden(format!("{key} can only be answered by a named human")));
+        }
+        self.store.deliver(key, payload)
+    }
+
+    /// Human resumes an escalated run; the failed step gets a fresh retry budget. Injection
+    /// waivers recorded since the last resume are delivered and audited under `by`.
+    pub fn resume_escalated(&self, run_id: &str, by: &str) -> Result<()> {
         let mut run = self.load(run_id)?;
         if run.state != RunState::Escalated {
             return Err(Error::Invalid(format!("run {run_id} is not escalated")));
         }
-        let failed = self.store.get_steps(run_id)?.into_iter().find(|s| s.status == StepStatus::Failed);
+        let by = named(by)?;
+        let steps = self.store.get_steps(run_id)?;
+        for (step_id, key) in self.pending_waivers(run_id)? {
+            let agent = steps.iter().find(|s| s.step_id == step_id).and_then(|s| s.agent_id.clone());
+            self.store.deliver(&key, &json!({"by": by}))?;
+            let detail = json!({"waived": key});
+            self.auditor(run_id, &step_id, agent).record(format!("{key}:waiver"), "waiver", &key, "", Decision::Approved, Some(by), detail)?;
+        }
+        let failed = steps.into_iter().find(|s| s.status == StepStatus::Failed);
         let failed = failed.map(|s| Step { attempt: 0, ..s });
         (run.state, run.wake) = (RunState::Running, None);
-        self.commit(&run, failed, &mut self.next_seq(run_id)?, vec![state_event("", "resumed by human", json!({}))])
+        let ev = state_event("", "resumed by human", json!({"by": by}));
+        self.commit(&run, failed, &mut self.next_seq(run_id)?, vec![ev])
     }
 
     pub fn cancel(&self, run_id: &str) -> Result<()> {
@@ -424,6 +629,65 @@ impl Engine {
         }
         (run.state, run.wake) = (RunState::Cancelled, None);
         self.commit(&run, None, &mut self.next_seq(run_id)?, vec![state_event("", "cancelled", json!({}))])
+    }
+
+    fn answer(&self, run_id: &str, approver: &str, approved: bool, reason: &str) -> Result<()> {
+        let by = named(approver)?;
+        let run = self.load(run_id)?;
+        let Some(Wake::Event(key)) = run.wake.clone().filter(|_| run.state == RunState::AwaitingApproval) else {
+            return Err(Error::Invalid(format!("run {run_id} is not awaiting approval")));
+        };
+        let (step_id, digest) = self.parked_action(run_id)?;
+        let mut payload = json!({"approved": approved, "by": by});
+        if let Some(d) = &digest {
+            payload["digest"] = json!(d);
+        }
+        if !approved {
+            payload["reason"] = json!(reason);
+        }
+        self.store.deliver(&key, &payload)?;
+        let agent = self.store.get_steps(run_id)?.into_iter().find(|s| s.step_id == step_id).and_then(|s| s.agent_id);
+        let (suffix, decision) = if approved { ("approve", Decision::Approved) } else { ("deny", Decision::Denied) };
+        let detail = json!({"reason": reason});
+        self.auditor(run_id, &step_id, agent).record(
+            format!("{key}:{suffix}"), "approval", &key, digest.as_deref().unwrap_or(""), decision, Some(by), detail,
+        )?;
+        let ev = (step_id, EventKind::Approval, json!({"key": key, "approved": approved, "by": by}));
+        self.commit(&run, None, &mut self.next_seq(run_id)?, vec![ev])
+    }
+
+    /// Step id and action digest of the latest park (budget and plain approval parks have no digest).
+    fn parked_action(&self, run_id: &str) -> Result<(String, Option<String>)> {
+        let log = self.store.read_run(run_id)?;
+        let parked = log.iter().rev().find(|e| e.kind == EventKind::State && e.payload["state"] == "parked");
+        Ok(parked.map_or((String::new(), None), |e| {
+            (e.step_id.clone(), e.payload["detail"]["action"]["digest"].as_str().map(String::from))
+        }))
+    }
+
+    /// `(step, waive key)` for every injection escalation since the last human resume.
+    fn pending_waivers(&self, run_id: &str) -> Result<Vec<(String, String)>> {
+        let mut out = vec![];
+        for e in self.store.read_run(run_id)?.iter().rev().filter(|e| e.kind == EventKind::State) {
+            match e.payload["state"].as_str() {
+                Some("resumed by human") => break,
+                Some("escalated") => {
+                    let keys = e.payload["detail"]["waive"].as_array().into_iter().flatten().filter_map(Value::as_str);
+                    out.extend(keys.map(|k| (e.step_id.clone(), k.to_string())));
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn budget_denied(&self, wake: &Option<Wake>) -> Result<bool> {
+        let Some(Wake::Event(k)) = wake else { return Ok(false) };
+        Ok(k.starts_with("budget:") && self.store.delivery(k)?.is_some_and(|d| d["approved"] == false))
+    }
+
+    fn auditor(&self, run_id: &str, step_id: &str, agent_id: Option<String>) -> Auditor {
+        Auditor { store: self.store.clone(), clock: self.clock.clone(), run_id: run_id.into(), step_id: step_id.into(), agent_id }
     }
 
     fn tick_due(&self, states: &[RunState]) -> Result<Vec<RunId>> {
@@ -467,6 +731,13 @@ impl Engine {
             })
             .collect();
         self.store.commit(&Commit { run, step, events })
+    }
+}
+
+fn named(by: &str) -> Result<&str> {
+    match by.trim() {
+        "" => Err(Error::Invalid("approver must be named".into())),
+        b => Ok(b),
     }
 }
 

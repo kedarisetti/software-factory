@@ -157,7 +157,7 @@ fn main() {
             })
         }
         "approve" => {
-            ex(engine.approve(&arg(1)));
+            ex(engine.approve(&arg(1), "cli"));
             json!({"approved": arg(1)})
         }
         "deliver" => {

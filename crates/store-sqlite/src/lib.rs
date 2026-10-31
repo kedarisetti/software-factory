@@ -1,7 +1,7 @@
 //! SQLite-backed durable store (DUR-1 to DUR-3, DUR-5). Depends only on sf-core.
 //!
 //! WAL plus `synchronous=FULL` makes every commit survive power loss (DUR-1).
-//! The event log is append-only, enforced by triggers (DUR-2).
+//! The event log and the audit log are append-only, enforced by triggers (DUR-2, GOV-audit).
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row, TransactionBehavior};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use sf_core::{Commit, Error, Event, Result, Run, RunState, Step, Store};
+use sf_core::{AuditRecord, Commit, Decision, Error, Event, Result, Run, RunState, Step, Store};
 
 /// Migrations, applied in order; `PRAGMA user_version` records how many have run.
 const MIGRATIONS: &[&str] = &["
@@ -38,6 +38,18 @@ CREATE TRIGGER events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 CREATE TABLE effects (key TEXT PRIMARY KEY, result TEXT NOT NULL);
 CREATE TABLE deliveries (key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+", "
+CREATE TABLE audit (
+    seq INTEGER PRIMARY KEY, key TEXT UNIQUE NOT NULL, ts INTEGER NOT NULL, run_id TEXT NOT NULL,
+    step_id TEXT NOT NULL, agent_id TEXT, action TEXT NOT NULL, target TEXT NOT NULL,
+    digest TEXT NOT NULL, decision TEXT NOT NULL, approver TEXT, detail TEXT NOT NULL,
+    prev_hash TEXT NOT NULL, hash TEXT NOT NULL
+);
+CREATE INDEX audit_run ON audit(run_id, seq);
+CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit
+BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
+CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit
+BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
 "];
 
 /// Durable [`Store`] on a local SQLite file.
@@ -119,6 +131,38 @@ fn event_from(r: &Row) -> rusqlite::Result<Result<Event>> {
         })
     };
     Ok(build())
+}
+
+const AUDIT_COLS: &str = "seq, ts, run_id, step_id, agent_id, key, action, target, digest, \
+    decision, approver, detail, prev_hash, hash";
+
+fn decision_str(d: Decision) -> Result<String> {
+    match serde_json::to_value(d) {
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        _ => Err(Error::Storage("decision did not serialize to a string".into())),
+    }
+}
+
+fn audit_from(r: &Row) -> rusqlite::Result<Result<AuditRecord>> {
+    let (decision, detail): (String, String) = (r.get(9)?, r.get(11)?);
+    Ok((|| {
+        Ok(AuditRecord {
+            seq: r.get::<_, i64>(0).map_err(err)? as u64,
+            ts: r.get::<_, i64>(1).map_err(err)? as u64,
+            run_id: r.get(2).map_err(err)?,
+            step_id: r.get(3).map_err(err)?,
+            agent_id: r.get(4).map_err(err)?,
+            key: r.get(5).map_err(err)?,
+            action: r.get(6).map_err(err)?,
+            target: r.get(7).map_err(err)?,
+            digest: r.get(8).map_err(err)?,
+            decision: unjson(&json(&decision)?)?,
+            approver: r.get(10).map_err(err)?,
+            detail: unjson(&detail)?,
+            prev_hash: r.get(12).map_err(err)?,
+            hash: r.get(13).map_err(err)?,
+        })
+    })())
 }
 
 fn insert_run(c: &Connection, run: &Run) -> Result<usize> {
@@ -302,6 +346,44 @@ impl Store for SqliteStore {
 
     fn delivery(&self, key: &str) -> Result<Option<serde_json::Value>> {
         self.get_json("SELECT payload FROM deliveries WHERE key = ?1", key)
+    }
+
+    /// One IMMEDIATE transaction: dedupe on key, else chain onto the last row.
+    fn append_audit(&self, rec: &AuditRecord) -> Result<AuditRecord> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
+        let sql = format!("SELECT {AUDIT_COLS} FROM audit WHERE key = ?1");
+        if let Some(r) = tx.query_row(&sql, [&rec.key], audit_from).optional().map_err(err)? {
+            return r;
+        }
+        let last: Option<(i64, String)> = tx
+            .query_row("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(err)?;
+        let mut r = rec.clone();
+        (r.seq, r.prev_hash) = match last {
+            Some((seq, hash)) => (seq as u64 + 1, hash),
+            None => (0, String::new()),
+        };
+        r.hash = r.compute_hash();
+        tx.execute(
+            &format!("INSERT INTO audit ({AUDIT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
+            params![
+                r.seq as i64, r.ts as i64, r.run_id, r.step_id, r.agent_id, r.key, r.action, r.target,
+                r.digest, decision_str(r.decision)?, r.approver, json(&r.detail)?, r.prev_hash, r.hash
+            ],
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(r)
+    }
+
+    fn read_audit(&self, run_id: Option<&str>) -> Result<Vec<AuditRecord>> {
+        let conn = self.lock();
+        let sql = format!("SELECT {AUDIT_COLS} FROM audit WHERE ?1 IS NULL OR run_id = ?1 ORDER BY seq");
+        let mut stmt = conn.prepare(&sql).map_err(err)?;
+        let rows = stmt.query_map([run_id], audit_from).map_err(err)?;
+        rows.map(|r| r.map_err(err)?).collect()
     }
 }
 
@@ -495,5 +577,113 @@ mod tests {
         }
         assert!(s.delivery("shared").unwrap().is_some());
         assert!(s.effect_result("once").unwrap().is_some());
+    }
+
+    fn arec(run_id: &str, key: &str) -> AuditRecord {
+        AuditRecord {
+            seq: 99, ts: 5, run_id: run_id.into(), step_id: "s1".into(), agent_id: Some("a".into()),
+            key: key.into(), action: "net.fetch".into(), target: "example.com".into(),
+            digest: "d".into(), decision: Decision::Blocked, approver: None,
+            detail: json!({"why": "egress"}), prev_hash: "x".into(), hash: "y".into(),
+        }
+    }
+
+    #[test]
+    fn audit_round_trip() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let a = s.append_audit(&arec("r1", "k0")).unwrap();
+        let b = s.append_audit(&arec("r2", "k1")).unwrap();
+        assert_eq!((a.seq, a.prev_hash.as_str()), (0, ""));
+        assert_eq!((b.seq, &b.prev_hash), (1, &a.hash));
+        assert_eq!(b.hash, b.compute_hash());
+        assert_eq!(s.read_audit(None).unwrap(), vec![a.clone(), b.clone()]);
+        assert_eq!(s.read_audit(Some("r2")).unwrap(), vec![b]);
+        assert!(s.read_audit(Some("none")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_dedupes_on_key() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let first = s.append_audit(&arec("r1", "k")).unwrap();
+        let mut again = arec("r1", "k");
+        again.action = "other".into();
+        assert_eq!(s.append_audit(&again).unwrap(), first);
+        assert_eq!(s.read_audit(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn audit_chain_valid_under_8_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(SqliteStore::open(dir.path().join("sf.db")).unwrap());
+        let hs: Vec<_> = (0..8)
+            .map(|t| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for i in 0..(if t < 2 { 7 } else { 6 }) {
+                        s.append_audit(&arec(&format!("r{t}"), &format!("k{t}-{i}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let log = s.read_audit(None).unwrap();
+        assert_eq!(log.len(), 50);
+        assert!(log.iter().enumerate().all(|(i, r)| r.seq == i as u64));
+        assert_eq!(sf_core::verify_chain(&log), Ok(()));
+    }
+
+    #[test]
+    fn audit_is_append_only() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.append_audit(&arec("r1", "k")).unwrap();
+        let conn = s.lock();
+        let u = conn.execute("UPDATE audit SET target='x'", []);
+        assert!(u.unwrap_err().to_string().contains("append-only"));
+        let d = conn.execute("DELETE FROM audit", []);
+        assert!(d.unwrap_err().to_string().contains("append-only"));
+    }
+
+    #[test]
+    fn audit_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sf.db");
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            s.append_audit(&arec("r1", "a")).unwrap();
+            s.append_audit(&arec("r1", "b")).unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        s.append_audit(&arec("r1", "c")).unwrap();
+        let log = s.read_audit(None).unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(sf_core::verify_chain(&log), Ok(()));
+    }
+
+    #[test]
+    fn m2_schema_db_migrates_and_keeps_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sf.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(MIGRATIONS[0]).unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+            run_insert_for_test(&c);
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        assert_eq!(s.read_run("r1").unwrap().len(), 1);
+        assert!(s.append_audit(&arec("r1", "k")).is_ok());
+        let v: i64 = s.lock().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+
+    fn run_insert_for_test(c: &Connection) {
+        insert_run(c, &run("r1", RunState::Queued, 1)).unwrap();
+        c.execute(
+            r#"INSERT INTO events (run_id, seq, step_id, kind, payload, ts) VALUES ('r1',0,'s','"ToolCall"','{}',1)"#,
+            [],
+        )
+        .unwrap();
     }
 }

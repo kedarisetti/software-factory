@@ -753,11 +753,11 @@ fn chat_trigger_cannot_deploy_even_with_auto_policy() {
     let env = Env::new();
     let ran = gated_wf(&env, Policy::default().gate_override(ActionKind::Deploy, Gate::Auto), act(ActionKind::Deploy, json!({})));
     let e = env.engine();
-    let id = e.start_run("wf", "slack:C1/1.0", 0, 0).unwrap();
+    let id = e.start_run("wf", "chat:team:C1/1.0", 0, 0).unwrap();
     e.tick(&id).unwrap();
     assert_eq!(env.state(&id), RunState::Escalated);
     assert_eq!(n(&ran), 0);
-    // intake's scheme for any chat source, e.g. an MCP Slack bridge
+    // any configured chat source name
     let id2 = e.start_run("wf", "chat:slack-mcp:C1/2.0", 0, 0).unwrap();
     e.tick(&id2).unwrap();
     assert_eq!(env.state(&id2), RunState::Escalated);
@@ -777,7 +777,7 @@ fn non_chat_trigger_deploy_still_gated_and_lookalike_prefix_is_not_chat() {
     let env = Env::new();
     let ran = gated_wf(&env, Policy::default(), act(ActionKind::Deploy, json!({})));
     let e = env.engine();
-    for t in ["github:org/repo#1", "slackish:1", "chatty:1"] {
+    for t in ["github:org/repo#1", "slack:C1/1.0", "chatty:1"] {
         let id = e.start_run("wf", t, 0, 0).unwrap();
         e.tick(&id).unwrap();
         assert_eq!(env.state(&id), RunState::AwaitingApproval, "{t}");
@@ -790,7 +790,7 @@ fn chat_trigger_may_still_do_other_actions() {
     let env = Env::new();
     let ran = gated_wf(&env, Policy::default(), act(ActionKind::DraftPr, json!({})));
     let e = env.engine();
-    let id = e.start_run("wf", "slack:C1/1.0", 0, 0).unwrap();
+    let id = e.start_run("wf", "chat:team:C1/1.0", 0, 0).unwrap();
     e.tick(&id).unwrap();
     assert_eq!(env.state(&id), RunState::Succeeded);
     assert_eq!(n(&ran), 1);

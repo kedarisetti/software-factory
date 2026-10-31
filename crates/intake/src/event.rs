@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntakeEvent {
-    /// Connector name: `slack`, `github`.
+    /// Configured source name.
     pub source: String,
     pub source_ref: String,
     /// Exact-duplicate key (TRG-2).

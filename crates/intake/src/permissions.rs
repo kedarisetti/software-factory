@@ -4,9 +4,6 @@ use serde::Deserialize;
 
 use crate::event::IntakeEvent;
 
-/// Chat sources assumed when the table is parsed without a source config (`from_json`). Configured
-/// deployments pass the real set, from `kind: slack` and `chat: true` sources, to `from_json_with_chat`.
-pub const CHAT_SOURCES: &[&str] = &["slack"];
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,13 +25,9 @@ pub struct PermissionTable {
     /// Workflows that can deploy. No chat source may allow one.
     #[serde(default)]
     pub deploy_workflows: Vec<String>,
-    /// Source names that are chat. Not part of the JSON; set by the loader from the source config.
-    #[serde(skip, default = "default_chat")]
+    /// Source names that are chat (`chat: true`). Not part of the JSON; set by the loader from the source config.
+    #[serde(skip)]
     pub chat_sources: Vec<String>,
-}
-
-fn default_chat() -> Vec<String> {
-    CHAT_SOURCES.iter().map(|s| s.to_string()).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

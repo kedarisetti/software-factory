@@ -43,11 +43,3 @@ impl ConnectorError {
         }
     }
 }
-
-pub(crate) fn str_at<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    v.get(key)?.as_str()
-}
-
-pub(crate) fn req<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a str, ConnectorError> {
-    str_at(v, key).ok_or_else(|| ConnectorError::Malformed(format!("missing {key}")))
-}

@@ -42,7 +42,7 @@ fn rule(name: &str, labels: &[&str], keywords: &[&str], score: i32) -> PriorityR
 impl Default for PriorityConfig {
     fn default() -> Self {
         PriorityConfig {
-            base: BTreeMap::from([("github".into(), 10), ("slack".into(), 5)]),
+            base: BTreeMap::new(),
             rules: vec![
                 rule("p0", &["p0", "priority:p0"], &["p0"], 100),
                 rule("incident", &["incident", "sev1"], &["incident", "outage"], 80),

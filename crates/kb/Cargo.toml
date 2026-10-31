@@ -1,0 +1,15 @@
+[package]
+name = "sf-kb"
+version = "0.0.0"
+edition.workspace = true
+description = "Knowledge service core: file-backed entries, the six KIF-4 operations, anchor checks."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

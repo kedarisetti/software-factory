@@ -1,0 +1,1 @@
+{"mcpServers":{"sf-kb":{"command":"/home/dharanish/Code/software-factory/target/release/sf-kb","args":["mcp","--agent","claude-code"],"env":{"SF_KB_ROOT":"/home/dharanish/Code/software-factory/kb","SF_KB_SESSION":"cc-exit-test"}}}}

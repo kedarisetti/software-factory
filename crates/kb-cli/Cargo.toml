@@ -1,0 +1,18 @@
+[package]
+name = "sf-kb-cli"
+version = "0.0.0"
+edition.workspace = true
+description = "Front doors for the knowledge service: the sf-kb CLI (JSON output) and its MCP server (sf-kb mcp)."
+
+[[bin]]
+name = "sf-kb"
+path = "src/main.rs"
+
+[dependencies]
+sf-kb.workspace = true
+sf-retrieval-tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

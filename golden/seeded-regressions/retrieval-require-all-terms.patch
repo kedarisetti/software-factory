@@ -1,0 +1,12 @@
+Seeded regression (ENT-1): the query parser switches to AND semantics, so a natural-language question with any unindexed word matches nothing.
+Expected: retrieval metrics collapse at every ladder size.
+--- a/crates/retrieval-tantivy/src/lib.rs	2026-10-31 15:47:08.858385354 -0400
++++ b/crates/retrieval-tantivy/src/lib.rs	2026-10-31 15:48:42.570896389 -0400
+@@ -165,6 +165,7 @@
+         }
+         let f = self.f;
+         let mut parser = QueryParser::for_index(&self.index, vec![f.title, f.path, f.tags, f.body, f.anchors, f.links]);
++        parser.set_conjunction_by_default();
+         for (field, boost) in [
+             (f.tags, BOOST_TAGS),
+             (f.title, BOOST_TITLE),

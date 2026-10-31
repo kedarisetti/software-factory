@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "metrics": {
+    "retrieval.10x.mrr": {
+      "value": 0.819508,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.10x.recall@10": {
+      "value": 0.863636,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.10x.recall@5": {
+      "value": 0.818182,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.10x.searches_per_question": {
+      "value": 1.0,
+      "direction": "lower",
+      "tolerance": 0.0
+    },
+    "retrieval.1x.mrr": {
+      "value": 0.893398,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.1x.recall@10": {
+      "value": 0.920455,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.1x.recall@5": {
+      "value": 0.897727,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.1x.searches_per_question": {
+      "value": 1.0,
+      "direction": "lower",
+      "tolerance": 0.0
+    },
+    "retrieval.30x.mrr": {
+      "value": 0.813258,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.30x.recall@10": {
+      "value": 0.818182,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.30x.recall@5": {
+      "value": 0.806818,
+      "direction": "higher",
+      "tolerance": 0.02
+    },
+    "retrieval.30x.searches_per_question": {
+      "value": 1.0,
+      "direction": "lower",
+      "tolerance": 0.0
+    },
+    "scanner.detection_rate": {
+      "value": 1.0,
+      "direction": "higher",
+      "tolerance": 0.0
+    },
+    "scanner.false_positive_rate": {
+      "value": 0.0,
+      "direction": "lower",
+      "tolerance": 0.0
+    },
+    "workflow.demo.pass": {
+      "value": 1.0,
+      "direction": "higher",
+      "tolerance": 0.0
+    },
+    "workflow.pass_rate": {
+      "value": 1.0,
+      "direction": "higher",
+      "tolerance": 0.0
+    },
+    "workflow.ship.pass": {
+      "value": 1.0,
+      "direction": "higher",
+      "tolerance": 0.0
+    }
+  }
+}

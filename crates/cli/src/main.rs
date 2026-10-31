@@ -6,8 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod sync;
+
 use serde_json::{json, Value};
-use sf_core::{verify_chain, Action, ActionKind, Error, EventKind, Limits, RunState, Store, SystemClock, ToolCall, Wake};
+use sha2::{Digest, Sha256};
+use sf_core::{
+    verify_chain, Action, ActionKind, Clock, Error, EventKind, Feedback, FeedbackSource, FeedbackTarget, FeedbackVerdict,
+    Limits, RunState, Store, SystemClock, ToolCall, Wake,
+};
 use sf_orchestrator::{Engine, Policy, Registry, StaticWorkflow, StepDef, StepResult};
 use sf_sandbox_local::LocalSandbox;
 use sf_store_sqlite::SqliteStore;
@@ -143,6 +149,116 @@ fn ship() -> Arc<StaticWorkflow> {
     StaticWorkflow::new("ship", 1, steps).with_policy(Policy::default().egress(vec![]))
 }
 
+fn hex_prefix(parts: &[&[u8]], n: usize) -> String {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+        h.update([0]);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()[..n].to_string()
+}
+
+/// Parse a feedback target (FBK-2): `run:<run>`, `step:<run>/<step>`,
+/// `artifact:<path-or-url>[#<span>][@<run>]`, `entry:<id>`, `template:<section>`.
+fn parse_target(t: &str) -> Result<FeedbackTarget, String> {
+    let bad = || format!("bad target {t:?}: want run:<run> | step:<run>/<step> | artifact:<path>[#span][@run] | entry:<id> | template:<section>");
+    let (kind, rest) = t.split_once(':').ok_or_else(bad)?;
+    if rest.is_empty() {
+        return Err(bad());
+    }
+    Ok(match kind {
+        "run" => FeedbackTarget::Run { run_id: rest.into() },
+        "step" => {
+            let (r, s) = rest.split_once('/').filter(|(r, s)| !r.is_empty() && !s.is_empty()).ok_or_else(bad)?;
+            FeedbackTarget::Step { run_id: r.into(), step_id: s.into() }
+        }
+        "artifact" => {
+            // A run suffix has no '/' or ':', so `https://user@host/x` stays a URL.
+            let (rest, run_id) = match rest.rsplit_once('@') {
+                Some((a, r)) if !a.is_empty() && !r.is_empty() && !r.contains(['/', ':', '#']) => (a, Some(r.to_string())),
+                _ => (rest, None),
+            };
+            let (artifact, span) = match rest.rsplit_once('#') {
+                Some((a, sp)) if !a.is_empty() && !sp.is_empty() && !sp.contains('/') => (a, Some(sp.to_string())),
+                _ => (rest, None),
+            };
+            FeedbackTarget::Artifact { run_id, artifact: artifact.into(), span }
+        }
+        "entry" => FeedbackTarget::Entry { entry_id: rest.into() },
+        "template" => FeedbackTarget::Template { section: rest.into() },
+        _ => return Err(bad()),
+    })
+}
+
+fn parse_verdict(v: &str) -> FeedbackVerdict {
+    ex(serde_json::from_value(json!(v)).map_err(|_| format!("unknown verdict {v:?}")))
+}
+
+/// Run and step targets must exist; the rest are free-form.
+fn validate_target(store: &dyn Store, t: &FeedbackTarget) {
+    match t {
+        FeedbackTarget::Run { run_id } => {
+            if ex(store.get_run(run_id)).is_none() {
+                die(format!("run {run_id} not found"));
+            }
+        }
+        FeedbackTarget::Step { run_id, step_id } => {
+            if ex(store.get_run(run_id)).is_none() {
+                die(format!("run {run_id} not found"));
+            }
+            if !ex(store.get_steps(run_id)).iter().any(|s| s.step_id == *step_id) {
+                die(format!("step {run_id}/{step_id} not found"));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Append, reporting whether the id was already recorded (a deduped re-send).
+fn record(store: &dyn Store, fb: &Feedback) -> Value {
+    let dup = ex(store.read_feedback(0)).iter().any(|f| f.feedback_id == fb.feedback_id);
+    let stored = ex(store.append_feedback(fb));
+    json!({"feedback": stored, "deduped": dup})
+}
+
+fn tail_2k(out: &[u8]) -> String {
+    String::from_utf8_lossy(&out[out.len().saturating_sub(2048)..]).into_owned()
+}
+
+/// FBK-1 auto source: run a trusted CI tool (no sandbox), record Pass/Fail, exit with its code.
+fn check(store: &dyn Store, flags: &[(String, String)], cmd: &[String]) -> ! {
+    let name = named(flags, "--name").unwrap_or_else(|| die("--name <check> is required"));
+    let tstr = named(flags, "--target").unwrap_or_else(|| die("--target <t> is required"));
+    let target = ex(parse_target(&tstr));
+    validate_target(store, &target);
+    let (prog, args) = cmd.split_first().unwrap_or_else(|| die("missing command after --"));
+    let t0 = std::time::Instant::now();
+    let o = ex(std::process::Command::new(prog).args(args).stdin(std::process::Stdio::null()).output());
+    let duration_ms = t0.elapsed().as_millis() as u64;
+    let mut all = o.stdout.clone();
+    all.extend_from_slice(&o.stderr);
+    let code = o.status.code();
+    let exit = code.unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        128 + o.status.signal().unwrap_or(0)
+    });
+    let fb = Feedback {
+        seq: 0,
+        feedback_id: format!("{name}:{}:{}", hex_prefix(&[tstr.as_bytes()], 12), hex_prefix(&[&all], 16)),
+        target,
+        source: FeedbackSource::Auto,
+        verdict: if o.status.success() { FeedbackVerdict::Pass } else { FeedbackVerdict::Fail },
+        note: None,
+        author: name,
+        ts: SystemClock.now(),
+        detail: json!({"exit_code": code, "duration_ms": duration_ms, "output_tail": tail_2k(&all)}),
+    };
+    let mut out = record(store, &fb);
+    out["exit_code"] = json!(exit);
+    emit(out);
+    std::process::exit(exit);
+}
+
 fn named(flags: &[(String, String)], name: &str) -> Option<String> {
     flags.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
 }
@@ -186,6 +302,11 @@ fn main() {
         std::process::exit(sf_sandbox_local::netshim::main(&argv[2..]));
     }
     let mut args: Vec<String> = argv.into_iter().skip(1).collect();
+    // Everything after `--` is a command line (`sf check`) and must not be parsed as flags.
+    let passthrough = args.iter().position(|a| a == "--").map(|i| {
+        let tail = args.split_off(i);
+        tail[1..].to_vec()
+    });
     let mut db: Option<String> = None;
     let mut sandbox: Option<String> = None;
     let mut unconfined = false;
@@ -212,7 +333,7 @@ fn main() {
             }
             "--budget-tokens" => budget_tokens = ex(val(&mut args).parse()),
             "--budget-usd-micros" => budget_usd = ex(val(&mut args).parse()),
-            "--as" | "--reason" => flags.push((a.clone(), val(&mut args))),
+            "--as" | "--reason" | "--target" | "--verdict" | "--note" | "--id" | "--name" | "--from" | "--kb" | "--golden" => flags.push((a.clone(), val(&mut args))),
             _ => rest.push(a),
         }
     }
@@ -235,7 +356,58 @@ fn main() {
         named(&flags, "--as").filter(|b| !b.trim().is_empty()).unwrap_or_else(|| die("--as <name> is required and must not be empty"))
     };
 
+    let who = |what: &str| named(&flags, "--as").filter(|b| !b.trim().is_empty()).unwrap_or_else(|| die(format!("--as <{what}> is required and must not be empty")));
+    let new_fb = |target: FeedbackTarget, source, verdict, author: String| {
+        validate_target(&*store, &target);
+        let note = named(&flags, "--note");
+        let ts = SystemClock.now();
+        let default_id = || {
+            let t = serde_json::to_string(&target).unwrap_or_default();
+            let v = format!("{verdict:?}");
+            format!("fb-{}", hex_prefix(&[t.as_bytes(), v.as_bytes(), author.as_bytes(), note.as_deref().unwrap_or("").as_bytes(), ts.to_string().as_bytes()], 24))
+        };
+        let feedback_id = named(&flags, "--id").unwrap_or_else(default_id);
+        Feedback { seq: 0, feedback_id, target, source, verdict, note, author, ts, detail: Value::Null }
+    };
+
     let out = match cmd.as_str() {
+        "feedback" => match arg(1).as_str() {
+            "add" => {
+                let target = ex(parse_target(&named(&flags, "--target").unwrap_or_else(|| die("--target <t> is required"))));
+                let verdict = parse_verdict(&named(&flags, "--verdict").unwrap_or_else(|| die("--verdict <v> is required")));
+                record(&*store, &new_fb(target, FeedbackSource::Human, verdict, who("name")))
+            }
+            "list" => {
+                let from = named(&flags, "--from").map_or(0, |f| ex(f.parse::<u64>()));
+                let want = named(&flags, "--target").map(|t| ex(parse_target(&t)));
+                let all = ex(store.read_feedback(from));
+                json!(all.into_iter().filter(|f| want.as_ref().is_none_or(|w| f.target == *w)).collect::<Vec<_>>())
+            }
+            "sync" => {
+                let kb_dir = named(&flags, "--kb").unwrap_or_else(|| die("--kb <kb dir> is required"));
+                let golden = named(&flags, "--golden").unwrap_or_else(|| "golden".into());
+                let kb = ex(sync::open_kb(std::path::Path::new(&kb_dir)));
+                ex(sync::sync(&*store, &kb, std::path::Path::new(&golden)))
+            }
+            "status" => {
+                let (v, over) = ex(sync::status(&*store));
+                if over {
+                    emit(v);
+                    std::process::exit(2); // FBK-3: oldest pending feedback is past the one-day bound
+                }
+                v
+            }
+            other => die(format!("unknown feedback subcommand {other}")),
+        },
+        "check" => check(&*store, &flags, passthrough.as_deref().unwrap_or(&[])),
+        "outcome" => {
+            let verdict = parse_verdict(&arg(2));
+            if !matches!(verdict, FeedbackVerdict::Survived | FeedbackVerdict::Reverted | FeedbackVerdict::Incident) {
+                die("outcome must be survived, reverted or incident");
+            }
+            let target = FeedbackTarget::Run { run_id: arg(1) };
+            record(&*store, &new_fb(target, FeedbackSource::Outcome, verdict, who("name-or-monitor")))
+        }
         "start" => {
             let id = ex(engine.start_run(&arg(1), "cli", budget_tokens, budget_usd));
             json!({"run_id": id})

@@ -1,0 +1,55 @@
+# ENT-1: every change runs the tests, clippy and the golden-set gate. A metric below its baseline
+# (beyond tolerance) fails eval-gate and blocks the merge. No path filters: prompts, tools, models and
+# workflows are all code in this repo today, so every change counts.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ubuntu-22.04 on purpose: it allows the unprivileged user namespaces bubblewrap needs; 24.04 blocks them via AppArmor.
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  clippy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  eval-gate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: target/debug/sf-eval gate --golden golden --baseline golden/baseline.json
+
+  # Proves the gate can fail: each golden/seeded-regressions/*.patch must be caught.
+  eval-gate-selftest:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/selftest"
+      - run: scripts/eval-gate-selftest.sh

@@ -12,7 +12,10 @@ sf-core.workspace = true
 sf-orchestrator.workspace = true
 sf-store-sqlite.workspace = true
 sf-sandbox-local.workspace = true
+sf-kb.workspace = true
+sf-retrieval-tantivy.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,0 +1,4 @@
+{
+  "injection": "crates/core/tests/injection_corpus.jsonl",
+  "benign": "crates/core/tests/benign_corpus.jsonl"
+}

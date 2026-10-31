@@ -210,6 +210,83 @@ pub trait Store: Send + Sync {
     fn append_audit(&self, rec: &AuditRecord) -> Result<AuditRecord>;
     /// Audit records in `seq` order, all runs or one run.
     fn read_audit(&self, run_id: Option<&str>) -> Result<Vec<AuditRecord>>;
+
+    /// Append a feedback record (FBK-2). Append-only; the store assigns `seq`. A record whose
+    /// `feedback_id` exists is not appended again and the stored one is returned.
+    fn append_feedback(&self, fb: &Feedback) -> Result<Feedback>;
+    /// Feedback with `seq >= from_seq`, in seq order (the FBK-3 sync reads from its watermark).
+    fn read_feedback(&self, from_seq: u64) -> Result<Vec<Feedback>>;
+    /// Small durable key-value cells for job watermarks (e.g. `feedback-sync`).
+    fn get_cursor(&self, name: &str) -> Result<Option<u64>>;
+    fn set_cursor(&self, name: &str, value: u64) -> Result<()>;
+}
+
+/// What a feedback record is about (FBK-2): a step, a span of an artifact, a knowledge entry, a
+/// whole run, or a section of the run-page template (UX-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FeedbackTarget {
+    Run { run_id: RunId },
+    Step { run_id: RunId, step_id: StepId },
+    /// `artifact` is a path, PR or URL; `span` a line range like `L10-L24` or a byte range.
+    Artifact { run_id: Option<RunId>, artifact: String, span: Option<String> },
+    Entry { entry_id: String },
+    Template { section: String },
+}
+
+/// Where feedback comes from (FBK-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackSource {
+    /// Tests, evals, linters.
+    Auto,
+    Human,
+    /// What happened after shipping: survived, reverted, incident.
+    Outcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackVerdict {
+    Pass,
+    Fail,
+    /// Knowledge entry verdicts (KIF feedback): helped, misled, wrong, stale.
+    Helped,
+    Misled,
+    Wrong,
+    Stale,
+    /// Outcome verdicts.
+    Survived,
+    Reverted,
+    Incident,
+    /// Human notes with no pass/fail meaning (unclear, too long, missing detail).
+    Comment,
+}
+
+impl FeedbackVerdict {
+    /// True for verdicts that say something went wrong.
+    pub fn is_negative(self) -> bool {
+        matches!(self, Self::Fail | Self::Misled | Self::Wrong | Self::Stale | Self::Reverted | Self::Incident)
+    }
+}
+
+/// One feedback record (docs/spec.md, "Data model").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Feedback {
+    /// Assigned by the store.
+    pub seq: u64,
+    /// Caller-chosen and unique; re-sending the same id is a no-op (a check re-run, a retried webhook).
+    pub feedback_id: String,
+    pub target: FeedbackTarget,
+    pub source: FeedbackSource,
+    pub verdict: FeedbackVerdict,
+    pub note: Option<String>,
+    /// Person or check name (`alice`, `cargo-test`, `outcome-monitor`).
+    pub author: String,
+    pub ts: Timestamp,
+    /// Check output summary, eval metrics, links. Free form.
+    #[serde(default)]
+    pub detail: serde_json::Value,
 }
 
 /// Who or what allowed an action.

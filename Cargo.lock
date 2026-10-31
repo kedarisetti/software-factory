@@ -875,9 +875,12 @@ version = "0.0.0"
 dependencies = [
  "serde_json",
  "sf-core",
+ "sf-kb",
  "sf-orchestrator",
+ "sf-retrieval-tantivy",
  "sf-sandbox-local",
  "sf-store-sqlite",
+ "sha2",
  "tempfile",
 ]
 
@@ -889,6 +892,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "sf-eval"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sf-core",
+ "sf-kb",
+ "sf-retrieval-tantivy",
+ "tempfile",
 ]
 
 [[package]]

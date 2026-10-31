@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use sf_core::{AuditRecord, Commit, Error, Event, Result, Run, RunState, Step, Store};
+use sf_core::{AuditRecord, Feedback, Commit, Error, Event, Result, Run, RunState, Step, Store};
 
 #[derive(Default)]
 struct Inner {
@@ -15,6 +15,8 @@ struct Inner {
     effects: HashMap<String, Value>,
     inbox: HashMap<String, Value>,
     audit: Vec<AuditRecord>,
+    feedback: Vec<Feedback>,
+    cursors: HashMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -120,5 +122,28 @@ impl Store for MemoryStore {
     fn read_audit(&self, run_id: Option<&str>) -> Result<Vec<AuditRecord>> {
         let g = self.0.lock().unwrap();
         Ok(g.audit.iter().filter(|r| run_id.is_none_or(|id| r.run_id == id)).cloned().collect())
+    }
+
+    fn append_feedback(&self, fb: &Feedback) -> Result<Feedback> {
+        let mut g = self.0.lock().unwrap();
+        if let Some(f) = g.feedback.iter().find(|f| f.feedback_id == fb.feedback_id) {
+            return Ok(f.clone());
+        }
+        let f = Feedback { seq: g.feedback.len() as u64, ..fb.clone() };
+        g.feedback.push(f.clone());
+        Ok(f)
+    }
+
+    fn read_feedback(&self, from_seq: u64) -> Result<Vec<Feedback>> {
+        Ok(self.0.lock().unwrap().feedback.iter().filter(|f| f.seq >= from_seq).cloned().collect())
+    }
+
+    fn get_cursor(&self, name: &str) -> Result<Option<u64>> {
+        Ok(self.0.lock().unwrap().cursors.get(name).copied())
+    }
+
+    fn set_cursor(&self, name: &str, value: u64) -> Result<()> {
+        self.0.lock().unwrap().cursors.insert(name.into(), value);
+        Ok(())
     }
 }

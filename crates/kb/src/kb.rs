@@ -873,7 +873,7 @@ mod tests {
         assert!(read(&dir, "learnings/index.md").contains("- [fix-ci/](fix-ci/index.md): 1 entry"));
         let folder = read(&dir, "learnings/fix-ci/index.md");
         assert!(folder.starts_with("# learnings/fix-ci\n") && folder.contains("## Entries"), "{folder}");
-        assert!(folder.contains("(pin-the-toolchain-then-rebuild.md): Pin the toolchain. · ×2"), "{folder}");
+        assert!(folder.contains("(pin-the-toolchain-then-rebuild.md) · ×2"), "summary repeating the title is dropped: {folder}");
         kb.feedback(&c, &id, Verdict::Stale, None).unwrap();
         assert!(read(&dir, "learnings/fix-ci/index.md").contains("· expired"));
         assert!(read(&dir, "index.md").contains("· expired"));

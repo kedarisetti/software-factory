@@ -1,17 +1,19 @@
-//! `Kb`: the file-backed implementation of `Knowledge` (KIF-1 to KIF-7).
+//! `Kb`: the file-backed implementation of `Knowledge` (KIF-1 to KIF-7) laid out as a wiki (WIKI-1 to WIKI-7).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::*;
+
+#[path = "wiki.rs"]
+mod wiki;
 
 /// Clock in unix milliseconds; injectable so TTL tests need no sleeping.
 pub type Now = fn() -> Timestamp;
@@ -22,28 +24,20 @@ pub struct Kb {
     now: Now,
 }
 
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+const KINDS: [EntryKind; 5] = [EntryKind::Note, EntryKind::Learning, EntryKind::Glossary, EntryKind::Convention, EntryKind::Page];
 
 fn system_now() -> Timestamp {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-fn hash8(s: &str) -> String {
-    Sha256::digest(s.as_bytes())[..4].iter().map(|b| format!("{b:02x}")).collect()
+/// LRN-3: hash of category + task class + normalized text.
+fn finding_key(cat: &str, task_class: &str, norm: &str) -> String {
+    let h = Sha256::digest(format!("{cat}|{}|{norm}", task_class.to_lowercase()).as_bytes());
+    h[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Lowercase alnum slug, words joined by `-`, at most `max` chars.
-fn slug(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    for c in s.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.truncate(max);
-    out.trim_matches('-').to_string()
+fn normalize(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 fn kind_str(k: EntryKind) -> &'static str {
@@ -52,16 +46,8 @@ fn kind_str(k: EntryKind) -> &'static str {
         EntryKind::Learning => "learning",
         EntryKind::Glossary => "glossary",
         EntryKind::Convention => "convention",
+        EntryKind::Page => "page",
     }
-}
-
-fn join_id(kind: EntryKind, slug: &str, hash: &str) -> String {
-    if slug.is_empty() { format!("{}-{hash}", kind_str(kind)) } else { format!("{}-{slug}-{hash}", kind_str(kind)) }
-}
-
-/// Path-traversal guard: IDs are `[a-z0-9-]{1,80}`.
-fn valid_id(id: &str) -> bool {
-    (1..=80).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Failed and reverted runs are one side of a contradiction (LRN-4); succeeded (or unknown) the other.
@@ -69,14 +55,55 @@ fn negative(o: Option<Outcome>) -> bool {
     matches!(o, Some(Outcome::Failed | Outcome::Reverted))
 }
 
+/// Parse a file; the path is the truth for the ID (WIKI-1).
+fn parse_at(text: &str, path: &Path, id: &str) -> Result<Entry> {
+    let mut e = parse_entry(text).map_err(|msg| Error::Parse { path: path.display().to_string(), msg })?;
+    e.meta.id = id.to_string();
+    Ok(e)
+}
+
+/// Entry files below `dir` (a kind folder, at most one topic level down), as `(id, path)`.
+fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+    let rd = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for ent in rd {
+        let path = ent?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let child = format!("{rel}/{name}");
+        if name.starts_with('.') {
+            continue;
+        } else if path.is_dir() {
+            if depth < 2 {
+                walk(&path, &child, depth + 1, out)?;
+            }
+        } else if let Some(stem) = child.strip_suffix(".md").filter(|s| !s.ends_with("/index") && valid_id(s)) {
+            out.push((stem.to_string(), path));
+        }
+    }
+    Ok(())
+}
+
 impl Kb {
-    /// Open (creating if needed) the store at `root`. Does not rebuild the index;
+    /// Open (creating if needed) the store at `root`: migrates a v1 `entries/` folder, writes `AGENTS.md`
+    /// if missing (WIKI-6) and a root `index.md` if missing. Does not rebuild the index unless it migrated;
     /// call `rebuild_index` when the cache is new or suspect.
     pub fn open(root: impl Into<PathBuf>, index: Box<dyn Index>) -> Result<Kb> {
         let root = root.into();
-        fs::create_dir_all(root.join("entries"))?;
         fs::create_dir_all(root.join(".kb").join("index"))?;
-        Ok(Kb { root, index, now: system_now })
+        let kb = Kb { root, index, now: system_now };
+        let _lock = kb.lock()?;
+        kb.migrate_v1()?;
+        let agents = kb.root.join("AGENTS.md");
+        if !agents.exists() {
+            wiki::write_atomic(&agents, wiki::AGENTS_MD.as_bytes())?;
+        }
+        if !kb.root.join("index.md").exists() {
+            kb.regen()?;
+        }
+        Ok(kb)
     }
 
     /// Replace the clock (tests).
@@ -89,11 +116,12 @@ impl Kb {
         &self.root
     }
 
-    /// Re-index every entry file (RET-5 nightly rebuild, or a fresh cache).
+    /// Re-index every entry file (RET-5 nightly rebuild, or a fresh cache) and regenerate the `index.md` files.
     /// A file that does not parse is an `Error::Parse` naming it.
     pub fn rebuild_index(&self) -> Result<usize> {
         let _lock = self.lock()?;
         let entries = self.load_all()?;
+        self.regen_with(&entries)?;
         let n = entries.len();
         self.index.rebuild(&mut entries.into_iter())?;
         Ok(n)
@@ -109,7 +137,7 @@ impl Kb {
     }
 
     fn entry_path(&self, id: &str) -> PathBuf {
-        self.root.join("entries").join(format!("{id}.md"))
+        self.root.join(format!("{id}.md"))
     }
 
     /// Exclusive cross-process writer lock (KIF-7); released when the file is dropped.
@@ -125,42 +153,118 @@ impl Kb {
         }
         let path = self.entry_path(id);
         match fs::read_to_string(&path) {
-            Ok(text) => parse_entry(&text).map_err(|msg| Error::Parse { path: path.display().to_string(), msg }),
+            Ok(_) if id.ends_with("/index") => Err(Error::NotFound(id.to_string())),
+            Ok(text) => parse_at(&text, &path, id),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound(id.to_string())),
             Err(e) => Err(e.into()),
         }
     }
 
+    /// Every entry, skipping `index.md`, `log.md`, `AGENTS.md` and temp files (they are not under a kind folder or are named so).
     fn load_all(&self) -> Result<Vec<Entry>> {
-        let mut out = vec![];
-        for ent in fs::read_dir(self.root.join("entries"))? {
-            let path = ent?.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name.contains(".tmp-") || !name.ends_with(".md") {
-                continue;
-            }
-            let text = fs::read_to_string(&path)?;
-            out.push(parse_entry(&text).map_err(|msg| Error::Parse { path: path.display().to_string(), msg })?);
+        let mut files = vec![];
+        for k in KINDS {
+            walk(&self.root.join(k.dir()), k.dir(), 1, &mut files)?;
         }
-        Ok(out)
+        files.sort();
+        files.iter().map(|(id, path)| parse_at(&fs::read_to_string(path)?, path, id)).collect()
     }
 
     /// Atomic write (temp file, fsync, rename) then index upsert. Caller holds the lock (KIF-7).
     fn store(&self, entry: &Entry) -> Result<()> {
-        let id = &entry.meta.id;
-        let dir = self.root.join("entries");
-        let tmp = dir.join(format!(".{id}.tmp-{}-{}", std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
-        let written = (|| {
-            let mut f = File::create(&tmp)?;
-            f.write_all(render_entry(entry).as_bytes())?;
-            f.sync_all()?;
-            fs::rename(&tmp, self.entry_path(id))
-        })();
-        if let Err(e) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(e.into());
+        let path = self.entry_path(&entry.meta.id);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
         }
+        wiki::write_atomic(&path, render_entry(entry).as_bytes())?;
         self.index.upsert(entry)
+    }
+
+    /// WIKI-2: rewrite every `index.md` whose text changed.
+    fn regen_with(&self, entries: &[Entry]) -> Result<()> {
+        for (dir, text) in wiki::render_indexes(entries) {
+            let path = self.root.join(&dir).join("index.md");
+            if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+                wiki::write_atomic(&path, text.as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn regen(&self) -> Result<()> {
+        self.regen_with(&self.load_all()?)
+    }
+
+    /// WIKI-3: append one line to `log.md`. Caller holds the lock.
+    fn change(&self, caller: &Caller, op: &str, id: &str, detail: &str) -> Result<()> {
+        let path = self.root.join("log.md");
+        let fresh = !path.exists();
+        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+        let line = wiki::log_line((self.now)(), &caller.agent, op, id, detail);
+        f.write_all(format!("{}{line}", if fresh { wiki::LOG_HEADER } else { "" }).as_bytes())?;
+        Ok(())
+    }
+
+    /// First free ID for `<dir>/<slug>`; a taken one gets `-2`, `-3`, ... (WIKI-1, never overwrite).
+    fn unique_id(&self, dir: &str, slug: &str, taken: &HashSet<String>) -> String {
+        let base = format!("{dir}/{slug}");
+        (1..)
+            .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
+            .find(|id| !taken.contains(id) && !self.entry_path(id).exists())
+            .expect("unbounded range")
+    }
+
+    /// Entries in one folder (not recursive), used to find a learning to merge into.
+    fn load_dir(&self, dir: &str) -> Result<Vec<Entry>> {
+        let mut files = vec![];
+        walk(&self.root.join(dir), dir, 2, &mut files)?;
+        files.iter().map(|(id, path)| parse_at(&fs::read_to_string(path)?, path, id)).collect()
+    }
+
+    /// Move a v1 `<root>/entries/<id>.md` store into the wiki layout, rewriting links to the new IDs.
+    fn migrate_v1(&self) -> Result<()> {
+        let old_dir = self.root.join("entries");
+        if !old_dir.is_dir() {
+            return Ok(());
+        }
+        let mut old = vec![];
+        for ent in fs::read_dir(&old_dir)? {
+            let path = ent?.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || !name.ends_with(".md") {
+                continue;
+            }
+            let text = fs::read_to_string(&path)?;
+            old.push((path.clone(), parse_entry(&text).map_err(|msg| Error::Parse { path: path.display().to_string(), msg })?));
+        }
+        old.sort_by(|a, b| (a.1.meta.created_at, &a.1.meta.id).cmp(&(b.1.meta.created_at, &b.1.meta.id)));
+        let (mut taken, mut map) = (HashSet::new(), HashMap::new());
+        for (_, e) in &old {
+            let m = &e.meta;
+            let id = self.unique_id(&wiki::dir_of(m.kind, m.task_class.as_deref(), &m.tags), &wiki::entry_slug(&m.title), &taken);
+            taken.insert(id.clone());
+            map.insert(m.id.clone(), id);
+        }
+        let who = Caller { agent: "migration".into(), session: "v1".into() };
+        for (path, mut e) in old {
+            let old_id = std::mem::take(&mut e.meta.id);
+            e.meta.id = map[&old_id].clone();
+            for l in &mut e.meta.links {
+                if let Some(n) = map.get(&l.target) {
+                    l.target = n.clone();
+                }
+            }
+            if e.meta.kind == EntryKind::Learning && e.meta.key.is_none() {
+                let cat = e.meta.tags.first().cloned().unwrap_or_default();
+                e.meta.key = Some(finding_key(&cat, e.meta.task_class.as_deref().unwrap_or(""), &normalize(&e.meta.title)));
+            }
+            self.store(&e)?;
+            self.change(&who, "migrate", &e.meta.id, &format!("from entries/{old_id}"))?;
+            fs::remove_file(path)?;
+            self.index.remove(&old_id)?;
+        }
+        let _ = fs::remove_dir(&old_dir);
+        self.regen()
     }
 
     /// Append one JSON line to the call log (KIF-5, RET-4). Logging never fails the operation.
@@ -206,6 +310,41 @@ impl Kb {
         Ok(hits)
     }
 
+    /// KIF-4 `list` (RET-7): subfolders with recursive counts, and the entries directly in `path`.
+    fn do_list(&self, path: &str) -> Result<Listing> {
+        let path = path.trim_matches('/');
+        let segs: Vec<&str> = if path.is_empty() { vec![] } else { path.split('/').collect() };
+        let ok_seg = |s: &&str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if segs.len() > 2 || !segs.iter().all(ok_seg) {
+            return Err(Error::Invalid(format!("bad folder path {path:?}")));
+        }
+        if segs.first().is_some_and(|d| !KINDS.iter().any(|k| k.dir() == *d) || !self.root.join(path).is_dir()) {
+            return Err(Error::NotFound(path.to_string()));
+        }
+        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+        let mut dirs: HashMap<String, usize> = HashMap::new();
+        let mut items = vec![];
+        for e in self.load_all()? {
+            let Some(rest) = e.meta.id.strip_prefix(&prefix) else { continue };
+            match rest.split_once('/') {
+                Some((d, _)) => *dirs.entry(format!("{prefix}{d}")).or_default() += 1,
+                None => items.push(ListItem {
+                    id: e.meta.id.clone(),
+                    title: e.meta.title.clone(),
+                    kind: e.meta.kind,
+                    status: e.meta.status,
+                    summary: wiki::summary(&e.body),
+                    count: e.meta.count,
+                    updated_at: e.meta.updated_at,
+                }),
+            }
+        }
+        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
+        let mut dirs: Vec<DirItem> = dirs.into_iter().map(|(path, entries)| DirItem { path, entries }).collect();
+        dirs.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Listing { path: path.to_string(), dirs, entries: items })
+    }
+
     fn do_add(&self, caller: &Caller, new: NewEntry) -> Result<Entry> {
         let title = new.title.trim().to_string();
         if title.is_empty() {
@@ -213,9 +352,10 @@ impl Kb {
         }
         let now = (self.now)();
         let kind = new.kind.unwrap_or(EntryKind::Note);
-        let h = hash8(&format!("{title}{}{now}{}", new.body, caller.agent));
+        let _lock = self.lock()?;
+        let dir = wiki::dir_of(kind, new.task_class.as_deref(), &new.tags);
         let meta = Meta {
-            id: join_id(kind, &slug(&title, 40), &h),
+            id: self.unique_id(&dir, &wiki::entry_slug(&title), &HashSet::new()),
             kind,
             title,
             tags: new.tags,
@@ -231,12 +371,14 @@ impl Kb {
             outcome: None,
             count: 1,
             source_runs: vec![],
+            key: None,
             helped: 0,
             misled: 0,
         };
         let entry = Entry { meta, body: new.body };
-        let _lock = self.lock()?;
         self.store(&entry)?;
+        self.change(caller, "add", &entry.meta.id, kind_str(kind))?;
+        self.regen()?;
         Ok(entry)
     }
 
@@ -251,28 +393,32 @@ impl Kb {
         items.extend(rec.shortest_path.as_deref().map(|s| ("shortest-path", s)));
         let steps = if rec.steps.is_empty() { String::new() } else { format!("\n\nSteps: {}\n", rec.steps.join(", ")) };
         let mut out = Learned { created: vec![], merged: vec![], expired: vec![] };
+        let dir = wiki::dir_of(EntryKind::Learning, Some(&tc), &[]);
         let _lock = self.lock()?;
         for (cat, text) in items {
             let text = text.trim();
             if text.is_empty() {
                 continue;
             }
-            let norm = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-            let key = format!("{norm}|{cat}|{}", tc.to_lowercase());
-            let id_for = |neg: bool| join_id(EntryKind::Learning, &slug(&norm, 40), &hash8(&format!("{key}|{}", if neg { "neg" } else { "pos" })));
-            let (id, opp_id) = (id_for(neg), id_for(!neg));
-            // LRN-4: a contradicting outcome expires the old learning and is linked from the new one.
-            let mut contradicted = None;
-            if let Ok(mut old) = self.load(&opp_id) {
-                if old.meta.status == EntryStatus::Active {
+            let key = finding_key(cat, &tc, &normalize(text));
+            // LRN-3/4: find the Active learning with this key in the topic folder; same side merges,
+            // the other side is contradicted: expired and linked from the new entry.
+            let (mut existing, mut contradicted) = (None, None);
+            for mut old in self.load_dir(&dir)? {
+                if old.meta.key.as_deref() != Some(&key) || old.meta.status != EntryStatus::Active {
+                    continue;
+                }
+                if negative(old.meta.outcome) == neg {
+                    existing = Some(old);
+                } else {
                     old.meta.status = EntryStatus::Expired;
                     old.meta.updated_at = now;
                     self.store(&old)?;
-                    out.expired.push(opp_id.clone());
-                    contradicted = Some(Link { kind: LinkType::Contradicts, target: opp_id.clone() });
+                    self.change(caller, "expire", &old.meta.id, "contradicted by a later outcome")?;
+                    out.expired.push(old.meta.id.clone());
+                    contradicted = Some(Link { kind: LinkType::Contradicts, target: old.meta.id.clone() });
                 }
             }
-            let existing = self.load(&id).ok().filter(|e| e.meta.status == EntryStatus::Active);
             let merging = existing.is_some();
             let mut e = match existing {
                 Some(mut e) => {
@@ -283,40 +429,47 @@ impl Kb {
                     }
                     e
                 }
-                None => Entry {
-                    meta: Meta {
-                        id: id.clone(),
-                        kind: EntryKind::Learning,
-                        title: text.chars().take(200).collect(),
-                        tags: vec![cat.to_string(), tc.clone()],
-                        task_class: Some(tc.clone()),
-                        links: vec![],
-                        anchors: vec![],
-                        source: format!("run:{}", caller.session),
-                        author: caller.clone(),
-                        created_at: now,
-                        updated_at: now,
-                        expires_at: None,
-                        status: EntryStatus::Active,
-                        outcome: rec.outcome,
-                        count: 1,
-                        source_runs: vec![caller.session.clone()],
-                        helped: 0,
-                        misled: 0,
-                    },
-                    body: format!("{text}\n{steps}"),
-                },
+                None => {
+                    let title: String = text.chars().take(200).collect();
+                    Entry {
+                        meta: Meta {
+                            id: self.unique_id(&dir, &wiki::entry_slug(&title), &HashSet::new()),
+                            kind: EntryKind::Learning,
+                            title,
+                            tags: vec![cat.to_string(), tc.clone()],
+                            task_class: Some(tc.clone()),
+                            links: vec![],
+                            anchors: vec![],
+                            source: format!("run:{}", caller.session),
+                            author: caller.clone(),
+                            created_at: now,
+                            updated_at: now,
+                            expires_at: None,
+                            status: EntryStatus::Active,
+                            outcome: rec.outcome,
+                            count: 1,
+                            source_runs: vec![caller.session.clone()],
+                            key: Some(key),
+                            helped: 0,
+                            misled: 0,
+                        },
+                        body: format!("{text}\n{steps}"),
+                    }
+                }
             };
             if let Some(l) = contradicted.filter(|l| !e.meta.links.contains(l)) {
                 e.meta.links.push(l);
             }
             self.store(&e)?;
+            let id = e.meta.id.clone();
+            self.change(caller, "learn", &id, &if merging { format!("merged, x{}", e.meta.count) } else { "created".into() })?;
             if merging { out.merged.push(id) } else { out.created.push(id) }
         }
+        self.regen()?;
         Ok(out)
     }
 
-    fn do_feedback(&self, id: &str, verdict: Verdict) -> Result<Entry> {
+    fn do_feedback(&self, caller: &Caller, id: &str, verdict: Verdict) -> Result<Entry> {
         if !valid_id(id) {
             return Err(Error::Invalid(format!("bad entry id {id:?}")));
         }
@@ -334,14 +487,24 @@ impl Kb {
         }
         e.meta.updated_at = (self.now)();
         self.store(&e)?;
+        self.change(caller, "feedback", id, &format!("{verdict:?}").to_lowercase())?;
+        self.regen()?;
         Ok(e)
     }
 
-    fn do_check_anchors(&self) -> Result<AnchorReport> {
+    fn do_check_anchors(&self, caller: &Caller) -> Result<AnchorReport> {
         let _lock = self.lock()?;
         let now = (self.now)();
-        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![] };
-        for mut e in self.load_all()? {
+        let mut report = AnchorReport { checked: 0, broken: vec![], repaired: vec![], dangling_links: vec![] };
+        let entries = self.load_all()?;
+        let ids: HashSet<&str> = entries.iter().map(|e| e.meta.id.as_str()).collect();
+        for e in &entries {
+            for l in e.meta.links.iter().filter(|l| !ids.contains(l.target.as_str())) {
+                report.dangling_links.push(DanglingLink { from: e.meta.id.clone(), to: l.target.clone() });
+            }
+        }
+        let mut changed = false;
+        for mut e in entries.clone() {
             if e.meta.anchors.is_empty() {
                 continue;
             }
@@ -353,18 +516,23 @@ impl Kb {
                     report.broken.push(AnchorProblem { id: e.meta.id.clone(), anchor: a.clone(), reason });
                 }
             }
-            let new_status = match (e.meta.status, any_broken) {
+            let (new_status, op) = match (e.meta.status, any_broken) {
                 (EntryStatus::Expired, _) => continue,
-                (EntryStatus::Active, true) => EntryStatus::BrokenAnchor,
+                (EntryStatus::Active, true) => (EntryStatus::BrokenAnchor, "broken-anchor"),
                 (EntryStatus::BrokenAnchor, false) => {
                     report.repaired.push(e.meta.id.clone());
-                    EntryStatus::Active
+                    (EntryStatus::Active, "repaired")
                 }
                 _ => continue,
             };
             e.meta.status = new_status;
             e.meta.updated_at = now;
             self.store(&e)?;
+            self.change(caller, op, &e.meta.id, "check_anchors")?;
+            changed = true;
+        }
+        if changed {
+            self.regen()?;
         }
         Ok(report)
     }
@@ -412,6 +580,11 @@ impl Knowledge for Kb {
         self.log(caller, "get", json!({"id": id}), &r, |e| json!({"id": e.meta.id}));
         r
     }
+    fn list(&self, caller: &Caller, path: &str) -> Result<Listing> {
+        let r = self.do_list(path);
+        self.log(caller, "list", json!({"path": path}), &r, |l| json!({"dirs": l.dirs.len(), "entries": l.entries.len()}));
+        r
+    }
     fn add(&self, caller: &Caller, entry: NewEntry) -> Result<Entry> {
         let args = json!({"title": entry.title, "kind": entry.kind, "tags": entry.tags, "task_class": entry.task_class});
         let r = self.do_add(caller, entry);
@@ -426,20 +599,21 @@ impl Knowledge for Kb {
         r
     }
     fn feedback(&self, caller: &Caller, id: &str, verdict: Verdict, note: Option<&str>) -> Result<Entry> {
-        let r = self.do_feedback(id, verdict);
+        let r = self.do_feedback(caller, id, verdict);
         self.log(caller, "feedback", json!({"id": id, "verdict": verdict, "note": note}), &r, |e| {
             json!({"id": e.meta.id, "status": e.meta.status, "helped": e.meta.helped, "misled": e.meta.misled})
         });
         r
     }
     fn check_anchors(&self, caller: &Caller) -> Result<AnchorReport> {
-        let r = self.do_check_anchors();
+        let r = self.do_check_anchors(caller);
         self.log(caller, "check_anchors", json!({}), &r, |a| {
             json!({"checked": a.checked, "broken": a.broken.iter().map(|b| &b.id).collect::<HashSet<_>>(), "repaired": a.repaired})
         });
         r
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -466,14 +640,15 @@ mod tests {
         let kb = open(dir.path());
         let c = who("pi", "s1");
         let e = kb.add(&c, NewEntry { ttl_ms: Some(10), ..note("Use cargo nextest", "Faster.") }).unwrap();
-        assert!(valid_id(&e.meta.id) && e.meta.id.starts_with("note-use-cargo-nextest-"));
+        assert_eq!(e.meta.id, "notes/general/use-cargo-nextest");
         assert_eq!((e.meta.author.clone(), e.meta.source.as_str(), e.meta.count), (c.clone(), "agent:pi/s1", 1));
         assert_eq!(e.meta.expires_at, Some(e.meta.created_at + 10));
         assert_eq!(kb.get(&c, &e.meta.id).unwrap(), e);
-        for bad in ["../x", "A", "", "a/b", &"a".repeat(81)] {
+        for bad in ["../x", "A", "", "nope", "notes/a.md", &"a".repeat(161)] {
             assert!(matches!(kb.get(&c, bad), Err(Error::Invalid(_))), "{bad}");
         }
-        assert!(matches!(kb.get(&c, "nope"), Err(Error::NotFound(_))));
+        assert!(matches!(kb.get(&c, "notes/general/nope"), Err(Error::NotFound(_))));
+        assert!(matches!(kb.get(&c, "notes/general/index"), Err(Error::NotFound(_))));
         assert!(matches!(kb.add(&c, note("  ", "x")), Err(Error::Invalid(_))));
     }
 
@@ -520,6 +695,8 @@ mod tests {
         assert_eq!((a.created.len(), b.created.len(), b.merged.clone()), (1, 0, a.created.clone()));
         let e = kb.get(&who("pi", "r1"), &a.created[0]).unwrap();
         assert_eq!((e.meta.count, e.meta.source_runs.clone()), (2, vec!["r1".to_string(), "r2".to_string()]));
+        assert_eq!(a.created[0], "learnings/fix-ci/re-run-flaky-ci-once");
+        assert!(e.meta.key.is_some());
         assert_eq!(e.meta.task_class.as_deref(), Some("fix-ci"));
         assert_eq!(e.meta.source, "run:r1");
         assert!(e.meta.updated_at >= e.meta.created_at);
@@ -639,7 +816,186 @@ mod tests {
         handles.into_iter().for_each(|h| h.join().unwrap());
         let fresh = open(dir.path());
         assert_eq!(fresh.rebuild_index().unwrap(), 80);
-        let tmp = fs::read_dir(dir.path().join("entries")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp-")).count();
+        assert_eq!(fs::read_to_string(dir.path().join("log.md")).unwrap().lines().filter(|l| l.starts_with("- ")).count(), 80);
+        let tmp = fs::read_dir(dir.path().join("notes/general")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp-")).count();
         assert_eq!(tmp, 0);
+    }
+
+    const T0: Timestamp = 1_000_000_000_000;
+
+    fn read(dir: &tempfile::TempDir, rel: &str) -> String {
+        fs::read_to_string(dir.path().join(rel)).unwrap()
+    }
+
+    #[test]
+    fn paths_are_descriptive_and_collisions_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "r1");
+        let l = kb.learn(&c, rec(Outcome::Succeeded, &["Pin the Rust toolchain"])).unwrap();
+        assert_eq!(l.created, ["learnings/fix-ci/pin-the-rust-toolchain"]);
+        assert!(dir.path().join("learnings/fix-ci/pin-the-rust-toolchain.md").is_file());
+        let tagged = kb.add(&c, NewEntry { tags: vec!["Rust CI".into()], ..note("Cache", "b") }).unwrap();
+        assert_eq!(tagged.meta.id, "notes/rust-ci/cache");
+        let long = kb.add(&c, note(&"word ".repeat(30), "b")).unwrap();
+        assert!(long.meta.id.len() <= "notes/general/".len() + 60 && long.meta.id.ends_with("-word"), "{}", long.meta.id);
+        let g = kb.add(&c, NewEntry { kind: Some(EntryKind::Glossary), ..note("Idempotency key", "b") }).unwrap();
+        assert_eq!(g.meta.id, "glossary/idempotency-key");
+        let (a, b, d) = (kb.add(&c, note("Same", "one")).unwrap(), kb.add(&c, note("Same", "two")).unwrap(), kb.add(&c, note("Same", "three")).unwrap());
+        assert_eq!((a.meta.id.as_str(), b.meta.id.as_str(), d.meta.id.as_str()), ("notes/general/same", "notes/general/same-2", "notes/general/same-3"));
+        assert_eq!(kb.get(&c, &a.meta.id).unwrap().body, "one");
+    }
+
+    #[test]
+    fn contradiction_collision_gets_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "r1");
+        let old = kb.learn(&c, rec(Outcome::Succeeded, &["bump the timeout"])).unwrap().created[0].clone();
+        let new = kb.learn(&c, rec(Outcome::Failed, &["bump the timeout"])).unwrap().created[0].clone();
+        assert_eq!((old.as_str(), new.as_str()), ("learnings/fix-ci/bump-the-timeout", "learnings/fix-ci/bump-the-timeout-2"));
+    }
+
+    #[test]
+    fn index_md_is_generated_per_folder_and_tracks_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path()).with_now(|| T0);
+        let c = who("pi", "r1");
+        let id = kb.learn(&c, rec(Outcome::Succeeded, &["Pin the toolchain. Then rebuild."])).unwrap().created[0].clone();
+        kb.learn(&who("pi", "r2"), rec(Outcome::Succeeded, &["Pin the toolchain. Then rebuild."])).unwrap();
+        kb.add(&c, note("Writer lock", "Held for writes.")).unwrap();
+        let root = read(&dir, "index.md");
+        assert!(root.starts_with("# Knowledge base\n"), "{root}");
+        for want in ["## Folders", "- [learnings/](learnings/index.md): 1 entry", "- [notes/](notes/index.md): 1 entry", "## Recently changed",
+            "(learnings/fix-ci/pin-the-toolchain-then-rebuild.md)", "AGENTS.md", "log.md"] {
+            assert!(root.contains(want), "{want} in {root}");
+        }
+        assert!(read(&dir, "learnings/index.md").contains("- [fix-ci/](fix-ci/index.md): 1 entry"));
+        let folder = read(&dir, "learnings/fix-ci/index.md");
+        assert!(folder.starts_with("# learnings/fix-ci\n") && folder.contains("## Entries"), "{folder}");
+        assert!(folder.contains("(pin-the-toolchain-then-rebuild.md) · ×2"), "summary repeating the title is dropped: {folder}");
+        kb.feedback(&c, &id, Verdict::Stale, None).unwrap();
+        assert!(read(&dir, "learnings/fix-ci/index.md").contains("· expired"));
+        assert!(read(&dir, "index.md").contains("· expired"));
+    }
+
+    #[test]
+    fn log_md_has_one_line_per_mutation_and_none_per_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path()).with_now(|| T0);
+        let c = who("pi", "r1");
+        let id = kb.add(&c, note("Logged", "body")).unwrap().meta.id;
+        kb.feedback(&c, &id, Verdict::Helped, None).unwrap();
+        kb.search(&c, "logged", None, 3).unwrap();
+        kb.get(&c, &id).unwrap();
+        kb.list(&c, "").unwrap();
+        let log = read(&dir, "log.md");
+        let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(lines, [
+            "- 2001-09-09T01:46:40Z **pi** add [[notes/general/logged]] (note)",
+            "- 2001-09-09T01:46:40Z **pi** feedback [[notes/general/logged]] (helped)",
+        ]);
+        let l = kb.learn(&c, rec(Outcome::Succeeded, &["x"])).unwrap();
+        kb.learn(&c, rec(Outcome::Succeeded, &["x"])).unwrap();
+        assert_eq!(l.created.len(), 1);
+        assert_eq!(read(&dir, "log.md").lines().filter(|l| l.starts_with("- ")).count(), 4);
+    }
+
+    #[test]
+    fn agents_md_is_created_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let text = read(&dir, "AGENTS.md");
+        assert!(text.lines().count() < 40 && text.contains("search") && text.contains("derived-from"));
+        assert!(dir.path().join("index.md").is_file());
+        drop(kb);
+        fs::write(dir.path().join("AGENTS.md"), "mine").unwrap();
+        let kb = open(dir.path());
+        kb.add(&who("pi", "s"), note("x", "y")).unwrap();
+        assert_eq!(read(&dir, "AGENTS.md"), "mine");
+    }
+
+    #[test]
+    fn list_root_folder_and_bad_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "r1");
+        kb.learn(&c, rec(Outcome::Succeeded, &["First finding. More text.", "Second finding"])).unwrap();
+        kb.add(&c, note("Lock", &"é".repeat(300))).unwrap();
+        let root = kb.list(&c, "").unwrap();
+        let dirs: Vec<_> = root.dirs.iter().map(|d| (d.path.as_str(), d.entries)).collect();
+        assert_eq!((root.path.as_str(), dirs, root.entries.len()), ("", vec![("learnings", 2), ("notes", 1)], 0));
+        let f = kb.list(&c, "learnings/fix-ci").unwrap();
+        assert!(f.dirs.is_empty());
+        assert_eq!(f.entries.iter().map(|i| i.summary.as_str()).collect::<std::collections::BTreeSet<_>>(), ["First finding.", "Second finding"].into());
+        assert_eq!(kb.list(&c, "learnings").unwrap().dirs, [DirItem { path: "learnings/fix-ci".into(), entries: 2 }]);
+        let n = &kb.list(&c, "notes/general").unwrap().entries[0];
+        assert_eq!((n.summary.chars().count(), n.id.as_str()), (120, "notes/general/lock"));
+        for bad in ["../x", "a/b/c", "Notes", "notes//x"] {
+            assert!(matches!(kb.list(&c, bad), Err(Error::Invalid(_))), "{bad}");
+        }
+        for missing in ["nope", "notes/none", ".kb"] {
+            assert!(matches!(kb.list(&c, missing), Err(Error::NotFound(_) | Error::Invalid(_))), "{missing}");
+        }
+        assert!(matches!(kb.list(&c, "notes/none"), Err(Error::NotFound(_))));
+        let last: Value = serde_json::from_str(read(&dir, ".kb/calls.jsonl").lines().last().unwrap()).unwrap();
+        assert_eq!(last["op"], "list");
+    }
+
+    #[test]
+    fn dangling_links_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "r1");
+        let src = kb.add(&c, note("Source", "s")).unwrap().meta.id;
+        let link = |t: &str| Link { kind: LinkType::DerivedFrom, target: t.into() };
+        let page = NewEntry { kind: Some(EntryKind::Page), links: vec![link(&src), link("notes/general/gone")], ..note("Summary", "p") };
+        let p = kb.add(&c, page).unwrap().meta.id;
+        let r = kb.check_anchors(&c).unwrap();
+        assert_eq!(r.dangling_links, [DanglingLink { from: p, to: "notes/general/gone".into() }]);
+    }
+
+    #[test]
+    fn page_with_derived_from_links_renders_footer_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = open(dir.path());
+        let c = who("pi", "r1");
+        let src = kb.add(&c, note("Source", "s")).unwrap().meta.id;
+        let links = vec![Link { kind: LinkType::DerivedFrom, target: src.clone() }];
+        let p = kb.add(&c, NewEntry { kind: Some(EntryKind::Page), links, ..note("Retrieval overview", "Summary body.") }).unwrap();
+        assert_eq!(p.meta.id, "pages/general/retrieval-overview");
+        let text = read(&dir, "pages/general/retrieval-overview.md");
+        assert!(text.contains(LINKS_MARKER) && text.ends_with("- derived-from: [[notes/general/source]]\n"), "{text}");
+        assert_eq!(kb.get(&c, &p.meta.id).unwrap(), p);
+        assert_eq!(parse_entry(&text).unwrap(), p);
+    }
+
+    #[test]
+    fn v1_store_is_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("entries")).unwrap();
+        let c = who("pi", "s1");
+        let e = |id: &str, kind, title: &str, tc: Option<&str>, links: Vec<Link>, created: u64| Entry {
+            meta: Meta {
+                id: id.into(), kind, title: title.into(), tags: vec![], task_class: tc.map(String::from), links, anchors: vec![],
+                source: "x".into(), author: c.clone(), created_at: created, updated_at: created, expires_at: None,
+                status: EntryStatus::Active, outcome: None, count: 1, source_runs: vec![], key: None, helped: 0, misled: 0,
+            },
+            body: "Old body.".into(),
+        };
+        let a = e("note-lock-1234abcd", EntryKind::Note, "Writer lock", None, vec![], 1);
+        let b = e("learning-pin-deadbeef", EntryKind::Learning, "Pin it", Some("fix-ci"), vec![Link { kind: LinkType::DependsOn, target: a.meta.id.clone() }], 2);
+        for x in [&a, &b] {
+            fs::write(dir.path().join(format!("entries/{}.md", x.meta.id)), render_entry(x)).unwrap();
+        }
+        let kb = open(dir.path());
+        assert!(!dir.path().join("entries").exists());
+        let moved = kb.get(&c, "learnings/fix-ci/pin-it").unwrap();
+        assert_eq!(moved.meta.links[0].target, "notes/general/writer-lock");
+        assert!(moved.meta.key.is_some());
+        assert_eq!(kb.get(&c, "notes/general/writer-lock").unwrap().body, "Old body.");
+        assert!(read(&dir, "index.md").contains("learnings/") && read(&dir, "log.md").contains("migrate [[notes/general/writer-lock]]"));
+        assert!(kb.check_anchors(&c).unwrap().dangling_links.is_empty());
+        assert_eq!(kb.rebuild_index().unwrap(), 2);
     }
 }

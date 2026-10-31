@@ -1,4 +1,4 @@
-//! The one place the six operations (KIF-4) are dispatched from JSON args. The CLI and the MCP
+//! The one place the seven operations (KIF-4) are dispatched from JSON args. The CLI and the MCP
 //! server both call [`dispatch`], so they behave identically (KIF-3).
 
 use serde::Deserialize;
@@ -8,7 +8,7 @@ use sf_kb::{Caller, Knowledge, LearningRecord, NewEntry, Verdict};
 /// `(code, message)`; codes are `sf_kb::Error::code()` plus `invalid` and `unknown_op`.
 pub type OpError = (String, String);
 
-pub const OPS: [&str; 6] = ["search", "get", "add", "learn", "feedback", "check_anchors"];
+pub const OPS: [&str; 7] = ["search", "get", "list", "add", "learn", "feedback", "check_anchors"];
 
 const DEFAULT_TOP_K: usize = 5;
 
@@ -22,6 +22,12 @@ struct SearchArgs {
 #[derive(Deserialize)]
 struct GetArgs {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct ListArgs {
+    #[serde(default)]
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +55,7 @@ pub fn dispatch(kb: &impl Knowledge, caller: &Caller, op: &str, args: Value) -> 
             out(kb.search(caller, &a.query, a.task_class.as_deref(), a.top_k.unwrap_or(DEFAULT_TOP_K)))
         }
         "get" => out(kb.get(caller, &args_of::<GetArgs>(args)?.id)),
+        "list" => out(kb.list(caller, &args_of::<ListArgs>(args)?.path)),
         "add" => out(kb.add(caller, args_of::<NewEntry>(args)?)),
         "learn" => out(kb.learn(caller, args_of::<LearningRecord>(args)?)),
         "feedback" => {
@@ -59,6 +66,12 @@ pub fn dispatch(kb: &impl Knowledge, caller: &Caller, op: &str, args: Value) -> 
         _ => Err(("unknown_op".into(), format!("unknown operation: {op}"))),
     }
 }
+
+/// The RET-7 flow in four lines; the MCP `initialize` result carries it as `instructions`.
+pub const FLOW: &str = "1. kb_search FIRST, with the task's own wording unchanged; reformulate only on later calls. Hits are paths + titles + snippets.\n\
+2. kb_get only the narrowed candidates.\n\
+3. kb_list a folder (start at \"\" for the root index) for \"everything about X\" or when search misses.\n\
+4. kb_learn at the end of the task; kb_add kind \"page\" for a synthesis page linking its sources with derived-from.";
 
 fn tool(op: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
@@ -80,8 +93,9 @@ pub fn tools() -> Vec<Value> {
     vec![
         tool(
             "search",
-            "Search the shared knowledge base (conventions, glossary, learnings from earlier runs by any agent). \
-             Call this BEFORE starting a task, and again when you get stuck. Returns ranked hits; use kb_get for the full entry.",
+            "Search the shared knowledge base (conventions, glossary, learnings from earlier runs, synthesis pages). \
+             Call this FIRST at the start of a task, with the task's own wording unchanged; reformulate only on later calls. \
+             Returns ranked hits: path (id), title and snippet. Then kb_get only the few that look relevant.",
             json!({
                 "query": s("Free-text query"),
                 "task_class": s("Only entries of this task class (plus class-less ones), e.g. fix-ci"),
@@ -91,17 +105,25 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "get",
-            "Read one knowledge entry in full by id (ids come from kb_search hits).",
-            json!({ "id": s("Entry id") }),
+            "Read one knowledge entry in full by id. Read only the narrowed candidates from kb_search or kb_list; the id is its path, e.g. learnings/fix-ci/pin-the-rust-toolchain.",
+            json!({ "id": s("Entry id: its path without .md") }),
             &["id"],
         ),
         tool(
+            "list",
+            "Browse one folder of the knowledge wiki: sub-folders with entry counts, and entries with title and summary. \
+             Start at \"\" for the root index. Best for \"everything about X\" questions, or when kb_search misses.",
+            json!({ "path": s("Folder relative to the root, e.g. learnings/fix-ci; empty or omitted for the root") }),
+            &[],
+        ),
+        tool(
             "add",
-            "Save a durable fact worth keeping: a convention, glossary term or note. For lessons from a finished task use kb_learn instead.",
+            "Save a durable fact worth keeping: a convention, glossary term or note. For a synthesis page over several entries use kind \"page\" \
+             and link each source with type derived-from. For lessons from a finished task use kb_learn instead.",
             json!({
                 "title": s("Short, searchable title"),
                 "body": s("Markdown body"),
-                "kind": { "type": "string", "enum": ["note", "learning", "glossary", "convention"] },
+                "kind": { "type": "string", "enum": ["note", "learning", "glossary", "convention", "page"] },
                 "tags": strs("Tags"),
                 "task_class": s("Task class this applies to; omit for all"),
                 "source": s("Where it came from: URL, ticket, file"),
@@ -165,7 +187,7 @@ pub mod tests {
             meta: Meta {
                 id: id.into(), kind: EntryKind::Note, title: title.into(), tags: vec![], task_class: None,
                 links: vec![], anchors: vec![], source: "t".into(), author: c.clone(), created_at: 1, updated_at: 1,
-                expires_at: None, status: EntryStatus::Active, outcome: None, count: 1, source_runs: vec![],
+                expires_at: None, status: EntryStatus::Active, outcome: None, count: 1, source_runs: vec![], key: None,
                 helped: 0, misled: 0,
             },
             body: "b".into(),
@@ -181,11 +203,15 @@ pub mod tests {
     impl Knowledge for Fake {
         fn search(&self, c: &Caller, q: &str, tc: Option<&str>, k: usize) -> Result<Vec<Hit>> {
             self.log("search", format!("{}|{q}|{tc:?}|{k}", c.agent));
-            Ok(vec![Hit { id: "a".into(), title: "A".into(), score: 1.0, kind: EntryKind::Note, snippet: "s".into() }])
+            Ok(vec![Hit { id: "notes/general/a".into(), title: "A".into(), score: 1.0, kind: EntryKind::Note, snippet: "s".into() }])
         }
         fn get(&self, c: &Caller, id: &str) -> Result<Entry> {
             self.log("get", id.into());
             if id == "missing" { Err(Error::NotFound(id.into())) } else { Ok(entry("T", id, c)) }
+        }
+        fn list(&self, _: &Caller, path: &str) -> Result<Listing> {
+            self.log("list", path.into());
+            Ok(Listing { path: path.into(), dirs: vec![DirItem { path: "notes".into(), entries: 2 }], entries: vec![] })
         }
         fn add(&self, c: &Caller, e: NewEntry) -> Result<Entry> {
             self.log("add", format!("{}|{:?}|{:?}|{:?}", e.title, e.kind, e.tags, e.ttl_ms));
@@ -201,7 +227,7 @@ pub mod tests {
         }
         fn check_anchors(&self, _: &Caller) -> Result<AnchorReport> {
             self.log("check_anchors", String::new());
-            Ok(AnchorReport { checked: 3, broken: vec![], repaired: vec![] })
+            Ok(AnchorReport { checked: 3, broken: vec![], repaired: vec![], dangling_links: vec![] })
         }
     }
 
@@ -217,11 +243,17 @@ pub mod tests {
     fn dispatch_every_op() {
         let (f, c) = (Fake::default(), caller());
         let r = dispatch(&f, &c, "search", json!({"query": "q", "task_class": "x"})).unwrap();
-        assert_eq!(r[0]["id"], "a");
+        assert_eq!(r[0]["id"], "notes/general/a");
         assert_eq!(last(&f), "pi|q|Some(\"x\")|5");
         dispatch(&f, &c, "search", json!({"query": "q", "top_k": 2})).unwrap();
         assert_eq!(last(&f), "pi|q|None|2");
-        assert_eq!(dispatch(&f, &c, "get", json!({"id": "e1"})).unwrap()["meta"]["id"], "e1");
+        assert_eq!(dispatch(&f, &c, "get", json!({"id": "notes/general/e1"})).unwrap()["meta"]["id"], "notes/general/e1");
+        assert_eq!(dispatch(&f, &c, "list", json!({"path": ""})).unwrap()["dirs"][0]["entries"], 2);
+        assert_eq!(last(&f), "");
+        dispatch(&f, &c, "list", json!({"path": "learnings/fix-ci"})).unwrap();
+        assert_eq!(last(&f), "learnings/fix-ci");
+        dispatch(&f, &c, "list", Value::Null).unwrap();
+        assert_eq!(last(&f), "");
         let r = dispatch(&f, &c, "add", json!({"title": "T", "body": "B", "kind": "glossary", "tags": ["t"], "ttl_ms": 5})).unwrap();
         assert_eq!(r["meta"]["title"], "T");
         assert_eq!(last(&f), "T|Some(Glossary)|[\"t\"]|Some(5)");
@@ -231,7 +263,7 @@ pub mod tests {
         dispatch(&f, &c, "feedback", json!({"id": "e1", "verdict": "stale", "note": "n"})).unwrap();
         assert_eq!(last(&f), "e1|Stale|Some(\"n\")");
         assert_eq!(dispatch(&f, &c, "check_anchors", Value::Null).unwrap()["checked"], 3);
-        assert_eq!(f.0.lock().unwrap().len(), 7);
+        assert_eq!(f.0.lock().unwrap().len(), 10, "7 ops plus 3 extra searches/lists");
     }
 
     #[test]
@@ -246,6 +278,7 @@ pub mod tests {
     #[test]
     fn tools_match_ops() {
         let t = tools();
+        assert_eq!(t.len(), 7, "one tool per op");
         assert_eq!(t.len(), OPS.len());
         for (tool, op) in t.iter().zip(OPS) {
             assert_eq!(op_for_tool(tool["name"].as_str().unwrap()), Some(op));

@@ -19,6 +19,7 @@ The factory turns tickets, threads and messages into shipped changes without a h
 - Fully autonomous production deploys. Deploys stay behind a human gate.
 - Bit-exact regeneration of model output. Replay reads from the event log instead.
 - Autonomous adoption of new tools or models found online. A human approves each one.
+- LLM-built graph indexes over the whole corpus (entity graphs, community reports). Their construction cost grows linearly or worse with the corpus, and BM25 matches or beats them at scale [1]. Structure comes from paths, generated index pages and explicit links instead.
 
 ## Architecture
 
@@ -89,12 +90,13 @@ Each requirement has an ID so tests, tickets and feedback can point at it. "Must
 
 ### Knowledge retrieval
 
-- **RET-1 (must):** Retrieval uses BM25 over knowledge entries and session learnings. Indexed fields: body, tags, anchor paths and link targets; tags get a higher field weight.
+- **RET-1 (must):** Retrieval uses BM25 over knowledge entries and session learnings. Indexed fields: body, title, tags, entry path (WIKI-1), anchor paths and link targets; tags, title and path get a higher field weight.
 - **RET-2 (must):** Expired entries (KNO-4) and entries with broken anchors (KNO-2) are filtered out before ranking.
 - **RET-3 (must):** Each subagent queries with its task-class filter and a per-class top-k, so it gets only the context its class needs (ENT-3).
 - **RET-4 (must):** Every retrieval is logged as an event (query, returned entry IDs, scores). Replay sees the same context, and feedback can name the entry that helped or misled.
 - **RET-5 (should):** The index updates on every knowledge write and rebuilds nightly with the anchor check.
-- **RET-6 (should):** Retrieval quality is measured on the golden set as recall@k of entries a human marked relevant. BM25 parameters (k1, b) are tuned against it.
+- **RET-6 (should):** Retrieval quality is measured on the golden set as recall@k of entries a human marked relevant. BM25 parameters (k1, b) and field weights are tuned against it. Evaluation follows [1]: a nested ladder of growing store sizes with the questions and relevant entries fixed, reporting accuracy, tool calls and tokens per question at each size, so a change that helps small stores but hurts large ones is visible.
+- **RET-7 (must):** Agents retrieve with search-then-navigate, the Agent+BM25 pattern from [1]. The first `search` uses the task's original wording, unchanged. Later searches may reformulate. The agent then reads (`get`) or browses (`list`) only the narrowed candidates. Tool descriptions in every front door say this. In [1] this beat both plain BM25 and file-browsing agents at every scale, at about a sixth of the calls of file browsing.
 
 ### Session learnings
 
@@ -109,13 +111,25 @@ Each requirement has an ID so tests, tickets and feedback can point at it. "Must
 Knowledge is pluggable: Pi, Claude Code, Codex and the factory's own agents all read and write the same store, so what one agent learns compounds for every other.
 
 - **KIF-1 (must):** Knowledge is a standalone component. It runs without the orchestrator, and any agent harness can use it.
-- **KIF-2 (must):** The source of truth is plain files: one Markdown file per entry, with YAML frontmatter for tags, typed links, anchors, source, author, run ID and expiry. The BM25 index and metadata database are caches, rebuilt from the files.
+- **KIF-2 (must):** The source of truth is plain files: one Markdown file per entry, with YAML frontmatter for tags, typed links, anchors, source, author, run ID and expiry. The BM25 index and metadata database are caches, rebuilt from the files. Generated wiki files (WIKI-2, WIKI-3) are rebuilt from the entries too.
 - **KIF-3 (must):** One core library with three front doors: a CLI (`sf-kb`) with JSON output, an MCP server, and a Rust crate. All three expose the same operations and behave identically.
-- **KIF-4 (must):** The contract has six operations: `search(query, task_class, top_k)`, `get(id)`, `add(entry)`, `learn(run, record)`, `feedback(id, verdict, note)` and `check_anchors()`.
+- **KIF-4 (must):** The contract has seven operations: `search(query, task_class, top_k)`, `get(id)`, `list(path)`, `add(entry)`, `learn(run, record)`, `feedback(id, verdict, note)` and `check_anchors()`.
 - **KIF-5 (must):** Every call records the calling agent (for example `pi`, `claude-code`, `factory`) and its run or session ID, so retrieval and learnings can be compared across agents (RET-4).
 - **KIF-6 (should):** Adapters stay thin and hold no logic: a Pi extension that wraps the CLI, and MCP configuration for MCP-capable agents.
 - **KIF-7 (should):** Concurrent writers are safe. Writes are atomic file renames plus an index lock, so several agents can learn at once.
 - **KIF-8 (should):** The contract is versioned. A breaking change bumps the version, and older clients get a clear error instead of wrong results.
+
+### Knowledge wiki
+
+The store doubles as a wiki that humans and agents navigate the same way: open `index.md`, follow paths and links, search when the target is unknown. The structure is generated by code from the entries, never by an LLM pass over the corpus. Search scales; browsing helps with small stores and with "list everything about X" questions [1].
+
+- **WIKI-1 (must):** Paths are descriptive: `<kind>/<topic>/<slug>.md`, for example `learnings/fix-ci/pin-the-rust-toolchain.md`. Kinds are `notes`, `learnings`, `conventions`, `glossary` and `pages`. The topic is the task class, else the first tag, else `general`. An entry's ID is its path without `.md`.
+- **WIKI-2 (must):** `index.md` at the root and in every folder lists the entries and subfolders below it, each with its title, a one-line summary, and its status and count where they apply. It is regenerated on every write. Humans and agents start navigation there.
+- **WIKI-3 (must):** `log.md` is an append-only, human-readable change log: time, agent, operation and the entries touched.
+- **WIKI-4 (must):** Typed links are also written as `[[wikilinks]]` in a generated footer below the body, so Markdown tools (Obsidian, GitHub) can show the graph and backlinks. The body above the footer is never rewritten.
+- **WIKI-5 (should):** Synthesis pages (kind `page`) summarise a topic across entries, with `derived-from` links to their sources. Agents write them one at a time with `add`, when a topic has enough entries to be worth a summary. There is no batch build.
+- **WIKI-6 (should):** `AGENTS.md` at the root states the layout and conventions, so any harness can find its way without the service's docs.
+- **WIKI-7 (should):** `check_anchors` also reports dangling links: links whose target entry does not exist.
 
 ### Triggers and intake
 
@@ -222,7 +236,7 @@ The headline metric is cost per successful task, tracked monthly: if the loops w
 
 Each milestone ships only when its exit criteria pass. Dates are not set yet.
 
-1. **Knowledge service.** KIF-1 to KIF-8, KNO-1 to KNO-4, RET-1 to RET-6, LRN-1 to LRN-4. Exit: Pi (through its extension) and one MCP agent (Claude Code) both search and write learnings to the same store; every call is logged with its agent; the anchor check runs. Useful on its own before the orchestrator exists.
+1. **Knowledge service.** KIF-1 to KIF-8, KNO-1 to KNO-4, RET-1 to RET-7, LRN-1 to LRN-4, WIKI-1 to WIKI-7. Exit: Pi (through its extension) and one MCP agent (Claude Code) both search and write learnings to the same store; every call is logged with its agent; the anchor check runs. Useful on its own before the orchestrator exists.
 2. **Durable core.** DUR-1 to DUR-6, SBX-4. Exit: a run survives a forced crash and a deploy mid-run; a retried step creates no duplicate side effect; cost baseline recorded.
 3. **Safe execution.** SBX-1 to SBX-3, approval gates, audit log. Exit: an injection test suite passes; every gated action parks and resumes on approval.
 4. **Verification loop.** FBK-1 to FBK-3, ENT-1. Exit: golden set runs in CI and blocks a seeded regression.
@@ -237,3 +251,7 @@ Each milestone ships only when its exit criteria pass. Dates are not set yet.
 - [ ] Who owns approvals for each gate, and what is the response-time expectation?
 - [ ] What is the first workflow class to run end to end?
 - [ ] How is "about 80% ASD-STE100" measured?
+
+## References
+
+[1] Wang et al., "BM25 Wins at Scale: A Scaling Study of Retrieval-Augmented Generation Paradigms", arXiv:2607.26497v2, 2026. https://arxiv.org/html/2607.26497v2

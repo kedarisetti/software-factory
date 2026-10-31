@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Write};
 use serde_json::{json, Value};
 use sf_kb::{Caller, Knowledge};
 
-use crate::dispatch::{dispatch, op_for_tool, tools};
+use crate::dispatch::{dispatch, op_for_tool, tools, FLOW};
 
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
 
@@ -54,6 +54,7 @@ impl<K: Knowledge, O: FnMut() -> sf_kb::Result<K>> Server<K, O> {
                     "protocolVersion": params["protocolVersion"].as_str().unwrap_or(DEFAULT_PROTOCOL),
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "sf-kb", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": FLOW,
                 }))
             }
             "ping" => Ok(json!({})),
@@ -113,6 +114,7 @@ mod tests {
     impl Knowledge for Shared {
         fn search(&self, c: &Caller, q: &str, t: Option<&str>, k: usize) -> sf_kb::Result<Vec<sf_kb::Hit>> { self.0.search(c, q, t, k) }
         fn get(&self, c: &Caller, id: &str) -> sf_kb::Result<sf_kb::Entry> { self.0.get(c, id) }
+        fn list(&self, c: &Caller, p: &str) -> sf_kb::Result<sf_kb::Listing> { self.0.list(c, p) }
         fn add(&self, c: &Caller, e: sf_kb::NewEntry) -> sf_kb::Result<sf_kb::Entry> { self.0.add(c, e) }
         fn learn(&self, c: &Caller, r: sf_kb::LearningRecord) -> sf_kb::Result<sf_kb::Learned> { self.0.learn(c, r) }
         fn feedback(&self, c: &Caller, id: &str, v: sf_kb::Verdict, n: Option<&str>) -> sf_kb::Result<sf_kb::Entry> { self.0.feedback(c, id, v, n) }
@@ -131,7 +133,10 @@ mod tests {
         assert_eq!(r.len(), 4, "no reply to the notification");
         assert_eq!(r[0]["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(r[0]["result"]["serverInfo"]["name"], "sf-kb");
-        assert_eq!(r[2]["result"]["tools"].as_array().unwrap().len(), 6);
+        let ins = r[0]["result"]["instructions"].as_str().unwrap();
+        assert_eq!(ins.lines().count(), 4);
+        assert!(ins.contains("kb_search FIRST") && ins.contains("kb_list"));
+        assert_eq!(r[2]["result"]["tools"].as_array().unwrap().len(), 7);
         assert_eq!(r[3]["error"]["code"], -32601);
     }
 
@@ -146,7 +151,7 @@ mod tests {
         assert_eq!(r[0]["result"]["protocolVersion"], DEFAULT_PROTOCOL);
         assert_eq!(r[1]["result"]["isError"], false);
         let text: Value = serde_json::from_str(r[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(text[0]["id"], "a");
+        assert_eq!(text[0]["id"], "notes/general/a");
         assert_eq!(fake.0.lock().unwrap()[0].1, "mcp:zed|q|None|5");
         assert_eq!(r[2]["result"]["isError"], true);
         assert!(r[2]["result"]["content"][0]["text"].as_str().unwrap().contains("not_found"));

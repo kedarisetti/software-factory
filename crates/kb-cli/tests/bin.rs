@@ -19,7 +19,7 @@ fn sf(args: &[&str]) -> (i32, Value) {
 #[test]
 fn version_ok_shape() {
     let (code, v) = sf(&["version"]);
-    assert_eq!((code, &v["ok"], &v["result"]["contract"]), (0, &json!(true), &json!(1)));
+    assert_eq!((code, &v["ok"], &v["result"]["contract"]), (0, &json!(true), &json!(2)));
 }
 
 #[test]
@@ -71,8 +71,9 @@ fn mcp_session() {
     assert_eq!(r[0]["id"], 1);
     assert_eq!(r[0]["result"]["protocolVersion"], "2025-03-26");
     assert_eq!(r[0]["result"]["capabilities"], json!({"tools": {}}));
+    assert!(r[0]["result"]["instructions"].as_str().unwrap().contains("kb_search FIRST"));
     let names: Vec<&str> = r[1]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["kb_search", "kb_get", "kb_add", "kb_learn", "kb_feedback", "kb_check_anchors"]);
+    assert_eq!(names, ["kb_search", "kb_get", "kb_list", "kb_add", "kb_learn", "kb_feedback", "kb_check_anchors"]);
     assert_eq!(r[2]["error"]["code"], -32601);
 }
 
@@ -102,6 +103,26 @@ fn cli_add_search_get() {
     let id = v["result"]["meta"]["id"].as_str().unwrap().to_string();
     let (_, v) = sf(&["--root", root, "search", "flaky"]);
     assert_eq!(v["result"][0]["id"], id.as_str());
-    let (code, v) = sf(&["--root", root, "get", "nope"]);
+}
+
+#[test]
+fn cli_get_missing_path_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let (code, v) = sf(&["--root", root, "get", "notes/general/nope"]);
     assert_eq!((code, &v["error"]["code"]), (1, &json!("not_found")));
+}
+
+#[test]
+fn cli_list_browses_the_wiki() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let (_, v) = sf(&["--root", root, "add", "--title", "Flaky CI retry", "--body", "Re-run once"]);
+    assert_eq!(v["result"]["meta"]["id"], "notes/general/flaky-ci-retry", "descriptive path ID (WIKI-1)");
+    let (code, v) = sf(&["--root", root, "list"]);
+    assert_eq!((code, &v["ok"]), (0, &json!(true)), "{v}");
+    assert_eq!(v["result"]["path"], "");
+    assert_eq!(v["result"]["dirs"][0]["path"], "notes");
+    let (_, v) = sf(&["--root", root, "list", "notes/general"]);
+    assert_eq!(v["result"]["entries"][0]["id"], "notes/general/flaky-ci-retry");
 }

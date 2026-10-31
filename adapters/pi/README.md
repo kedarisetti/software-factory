@@ -1,6 +1,15 @@
 # Pi adapter for sf-kb (KIF-6)
 
-`sf-kb.ts` registers `kb_search`, `kb_get`, `kb_add`, `kb_learn` and `kb_feedback` in Pi. Each tool shells out to the `sf-kb` CLI with `--agent pi --session <pi session id>` and returns its JSON. It holds no logic.
+`sf-kb.ts` registers `kb_search`, `kb_get`, `kb_list`, `kb_add`, `kb_learn` and `kb_feedback` in Pi. Each tool shells out to the `sf-kb` CLI with `--agent pi --session <pi session id>` and returns its JSON. It holds no logic.
+
+## Wiki and flow
+
+The store is a browsable wiki of plain Markdown: `<kind>/<topic>/<slug>.md`, with a generated `index.md` in every folder. Open the store folder in Obsidian, or read `index.md` on GitHub if it is committed. Agents use the same tree through the tools:
+
+1. `kb_search` first, with the task's own wording unchanged; reformulate only on later calls. Hits are paths + titles + snippets.
+2. `kb_get` only the narrowed candidates.
+3. `kb_list` a folder (start at `""`) for "everything about X", or when search misses.
+4. `kb_learn` at the end of the task; `kb_add` with kind `page` for a synthesis page linking its sources with `derived-from`.
 
 ## Install
 

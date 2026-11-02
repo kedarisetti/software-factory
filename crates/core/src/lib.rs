@@ -221,6 +221,68 @@ pub trait Store: Send + Sync {
     fn set_cursor(&self, name: &str, value: u64) -> Result<()>;
 }
 
+/// Status of a work item in the intake queue (TRG-1, TRG-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemStatus {
+    /// Accepted and waiting for dispatch.
+    Queued,
+    /// Dispatched: `run_id` is set.
+    Started,
+    /// Refused by the permission table or by validation (TRG-3); `reason` says why.
+    Rejected,
+    /// Over a source or actor rate limit (TRG-2). Kept, not dropped, so nothing vanishes silently.
+    RateLimited,
+    /// A backlog item from intake analysis (TRG-4), not dispatched automatically.
+    Backlog,
+    /// Dispatched run reached a terminal state.
+    Done,
+}
+
+/// One unit of "what needs doing". Lives in the work queue, never in the knowledge base (TRG-1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub item_id: String,
+    /// Configured source name, `cli`, `intake-analysis`.
+    pub source: String,
+    /// Where it came from, for humans: a permalink, `org/repo#12`, `C024BE91L/1712345678.000100`.
+    pub source_ref: String,
+    /// Two events with the same key are one item (TRG-2): a delivery or event id, or
+    /// issue + action, or a content hash for near-duplicates.
+    pub dedupe_key: String,
+    /// Who triggered it (user id or login). Used for permissions and rate limits.
+    pub actor: String,
+    /// Channel id or `org/repo`. Used by the permission table.
+    pub channel: String,
+    /// Workflow to start, once resolved and allowed.
+    pub workflow: Option<String>,
+    /// Higher runs first (TRG-2).
+    pub priority: i32,
+    pub status: ItemStatus,
+    pub reason: Option<String>,
+    pub run_id: Option<RunId>,
+    /// The connector's normalised event: text, labels, title. Untrusted content (SBX-3).
+    pub payload: serde_json::Value,
+    pub received_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+/// The work queue (TRG-1). Separate from the knowledge base and from run state.
+pub trait Queue: Send + Sync {
+    /// Insert unless an item with the same `dedupe_key` exists. Returns the stored item and
+    /// whether it was inserted now (`false` = duplicate, nothing changed).
+    fn enqueue(&self, item: &WorkItem) -> Result<(WorkItem, bool)>;
+    fn get_item(&self, item_id: &str) -> Result<Option<WorkItem>>;
+    /// Items in any of `statuses`, highest priority first, then oldest first; at most `limit`.
+    fn list_items(&self, statuses: &[ItemStatus], limit: usize) -> Result<Vec<WorkItem>>;
+    /// Replace the item's mutable fields (status, reason, run_id, workflow, priority, updated_at).
+    /// `NotFound` if absent.
+    fn update_item(&self, item: &WorkItem) -> Result<()>;
+    /// Items from `source` (and `actor`, if given) received at or after `since`, any status,
+    /// duplicates excluded (TRG-2 rate limits).
+    fn count_items_since(&self, source: &str, actor: Option<&str>, since: Timestamp) -> Result<u64>;
+}
+
 /// What a feedback record is about (FBK-2): a step, a span of an artifact, a knowledge entry, a
 /// whole run, or a section of the run-page template (UX-7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

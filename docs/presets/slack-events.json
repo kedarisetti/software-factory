@@ -1,0 +1,34 @@
+{
+  "name": "team-chat",
+  "kind": "webhook",
+  "chat": true,
+  "verify": {
+    "secret_env": "SF_CHAT_SIGNING_SECRET",
+    "header": "X-Slack-Signature",
+    "prefix": "v0=",
+    "signed": "v0:{header:X-Slack-Request-Timestamp}:{body}",
+    "timestamp_header": "X-Slack-Request-Timestamp",
+    "max_skew_s": 300
+  },
+  "challenge": { "when": { "/type": "url_verification" }, "reply": "/challenge" },
+  "events": {
+    "only": [{ "/type": "event_callback", "/event/type": ["message", "app_mention"] }],
+    "ignore": [
+      { "/event/bot_id": { "exists": true } },
+      { "/event/subtype": { "exists": true } },
+      { "/event/user": "U0FACTORY" },
+      { "/event/type": "message", "/event/text": { "contains": "<@U0FACTORY>" } }
+    ],
+    "map": {
+      "id": "{/event/channel}/{/event/ts}",
+      "text": "/event/text",
+      "actor": "/event/user",
+      "channel": "/event/channel",
+      "dedupe": "{/event_id}"
+    },
+    "workflow": [
+      { "command": { "mention": "<@U0FACTORY>" } },
+      { "by_channel": { "C0FACTORY": "demo" } }
+    ]
+  }
+}

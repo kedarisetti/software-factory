@@ -1,0 +1,1 @@
+{"action":"labeled","issue":{"html_url":"https://github.com/acme/shop/issues/43","number":43,"title":"Typo in README","user":{"login":"hubot"},"labels":[{"name":"docs"},{"name":"factory:docs-fix"}],"state":"open","body":null},"label":{"id":9,"name":"factory:docs-fix"},"repository":{"full_name":"acme/shop"},"sender":{"login":"maintainer"}}

@@ -1,4 +1,4 @@
-//! Content from tickets, Slack, email, the web and tool output is data, never instructions (SBX-3).
+//! Content from tickets, chat, email, the web and tool output is data, never instructions (SBX-3).
 //!
 //! Two layers. `Untrusted::render` frames content so a model sees where data starts and ends.
 //! `scan` flags text that reads like instructions to the agent; the engine escalates on a hit.

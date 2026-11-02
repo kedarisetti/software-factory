@@ -873,8 +873,10 @@ dependencies = [
 name = "sf-cli"
 version = "0.0.0"
 dependencies = [
+ "serde",
  "serde_json",
  "sf-core",
+ "sf-intake",
  "sf-kb",
  "sf-orchestrator",
  "sf-retrieval-tantivy",
@@ -904,6 +906,17 @@ dependencies = [
  "sf-kb",
  "sf-retrieval-tantivy",
  "tempfile",
+]
+
+[[package]]
+name = "sf-intake"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sf-core",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

@@ -9,6 +9,14 @@ pub mod policy;
 
 pub use policy::{Gate, Policy};
 
+/// Trigger ref prefixes that are chat. A run triggered from chat can never deploy (GOV, SBX-3).
+/// Intake dispatches every chat source (`chat: true` in its config) as `chat:<source>:<ref>`.
+pub const CHAT_SOURCES: [&str; 1] = ["chat"];
+
+fn from_chat(trigger_ref: &str) -> bool {
+    CHAT_SOURCES.iter().any(|s| trigger_ref.strip_prefix(s).is_some_and(|r| r.starts_with(':')))
+}
+
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::{json, Value};
 use sf_core::{
-    effect_key, idempotency_key, Action, Clock, Commit, Credentials, Decision, Error, Event, EventKind, KillSwitch,
+    effect_key, idempotency_key, Action, ActionKind, Clock, Commit, Credentials, Decision, Error, Event, EventKind, KillSwitch,
     Limits, Result, Run, RunId, RunState, Sandbox, Step, StepStatus, Store, Timestamp, ToolCall, ToolOutput, Wake,
 };
 use sf_core::untrusted::{scan, Untrusted};
@@ -160,6 +168,8 @@ pub struct StepCtx {
     pub outputs: HashMap<String, Value>,
     /// `Some` when resuming from a park (delivered payload, or `Null` after a timer).
     pub payload: Option<Value>,
+    trigger_ref: String,
+    input: Option<Value>,
     store: Arc<dyn Store>,
     sandbox: Arc<dyn Sandbox>,
     kill: KillSwitch,
@@ -192,6 +202,11 @@ struct Escalation {
 }
 
 impl StepCtx {
+    /// The input the run was started with (`Engine::start_run_with_input`), if any (TRG-1).
+    pub fn input(&self) -> Option<Value> {
+        self.input.clone()
+    }
+
     /// Append an event to this step's checkpoint commit (DUR-2).
     pub fn event(&mut self, kind: EventKind, payload: Value) {
         self.events.push((kind, payload));
@@ -259,11 +274,14 @@ impl StepCtx {
     /// new approval. A denial escalates the run.
     pub fn action(&mut self, action: &Action, f: impl FnOnce(&str) -> Result<Value>) -> Result<Value> {
         let key = effect_key(&self.step_key, self.n);
+        let digest = action.digest();
+        let (name, detail) = (action.kind.name(), action.detail.clone());
+        if action.kind == ActionKind::Deploy && from_chat(&self.trigger_ref) {
+            return self.chat_deploy_blocked(&key, action, &digest);
+        }
         if self.store.effect_result(&key)?.is_some() {
             return self.run_action(action, f);
         }
-        let digest = action.digest();
-        let (name, detail) = (action.kind.name(), action.detail.clone());
         if self.policy.gate(&action.kind) == Gate::Auto {
             self.audit.record(format!("{key}:auto"), &name, &action.target, &digest, Decision::Auto, None, detail)?;
             return self.run_action(action, f);
@@ -295,6 +313,15 @@ impl StepCtx {
         }
     }
 
+    /// No chat message can start a deploy: audit, escalate, and no approval can override it.
+    fn chat_deploy_blocked(&mut self, key: &str, action: &Action, digest: &str) -> Result<Value> {
+        let reason = format!("deploy from chat trigger {}", self.trigger_ref);
+        let detail = json!({"reason": reason, "action": action.detail});
+        self.audit.record(format!("{key}:blocked"), &action.kind.name(), &action.target, digest, Decision::Blocked, None, detail)?;
+        self.escalation = Some(Escalation { reason: reason.clone(), waives: vec![] });
+        Err(Error::Forbidden(reason))
+    }
+
     fn run_action(&mut self, action: &Action, f: impl FnOnce(&str) -> Result<Value>) -> Result<Value> {
         let (v, fresh) = self.guarded(f)?;
         if fresh {
@@ -303,7 +330,7 @@ impl StepCtx {
         Ok(v)
     }
 
-    /// Wrap content from tickets, Slack, email or the web (SBX-3). If the scan finds instruction-like
+    /// Wrap content from tickets, chat, email or the web (SBX-3). If the scan finds instruction-like
     /// text and no human has waived this exact content, audit it, escalate the run and fail.
     pub fn untrusted(&mut self, source: &str, content: &str) -> Result<Untrusted> {
         let u = Untrusted::new(source, content);
@@ -380,11 +407,32 @@ impl Engine {
 
     /// Create a run pinned to the latest registered version of `workflow_id` (DUR-6).
     pub fn start_run(&self, workflow_id: &str, trigger_ref: &str, budget_tokens: u64, budget_usd_micros: u64) -> Result<RunId> {
+        self.start(workflow_id, trigger_ref, budget_tokens, budget_usd_micros, None)
+    }
+
+    /// Like `start_run`, with an input (the work item payload) stored durably before the run can
+    /// tick; steps read it with `StepCtx::input` (TRG-1).
+    pub fn start_run_with_input(
+        &self,
+        workflow_id: &str,
+        trigger_ref: &str,
+        budget_tokens: u64,
+        budget_usd_micros: u64,
+        input: Value,
+    ) -> Result<RunId> {
+        self.start(workflow_id, trigger_ref, budget_tokens, budget_usd_micros, Some(input))
+    }
+
+    fn start(&self, workflow_id: &str, trigger_ref: &str, budget_tokens: u64, budget_usd_micros: u64, input: Option<Value>) -> Result<RunId> {
         let wf = self.registry.latest(workflow_id).ok_or_else(|| Error::NotFound(format!("workflow {workflow_id}")))?;
         let now = self.clock.now();
         loop {
+            let run_id = format!("run-{now}-{}-{}", std::process::id(), self.counter.fetch_add(1, Ordering::SeqCst));
+            if let Some(v) = &input {
+                self.store.deliver(&format!("input:{run_id}"), v)?; // durable before the run exists
+            }
             let run = Run {
-                run_id: format!("run-{now}-{}-{}", std::process::id(), self.counter.fetch_add(1, Ordering::SeqCst)),
+                run_id,
                 workflow_id: workflow_id.into(),
                 workflow_version: wf.version(),
                 trigger_ref: trigger_ref.into(),
@@ -438,6 +486,7 @@ impl Engine {
             self.commit(&run, None, &mut seq, evs)?;
             return Ok(run.state);
         }
+        let input = self.store.delivery(&format!("input:{run_id}"))?;
         loop {
             if self.kill.is_tripped() {
                 return Ok(run.state); // stays resumable (SBX-4)
@@ -466,6 +515,8 @@ impl Engine {
                 attempt,
                 outputs: steps.values().filter_map(|s| Some((s.step_id.clone(), s.output.clone()?))).collect(),
                 payload,
+                trigger_ref: run.trigger_ref.clone(),
+                input: input.clone(),
                 store: self.store.clone(),
                 sandbox: self.sandbox.clone(),
                 kill: self.kill.clone(),
@@ -599,12 +650,24 @@ impl Engine {
     }
 
     /// Deliver an external event (CI result, reply). Approvals, budget answers and waivers need a
-    /// named human through `approve`, `deny` or `resume_escalated`, so those keys are refused.
+    /// named human through `approve`, `deny` or `resume_escalated`, and run inputs are written only
+    /// at start, so those keys are refused.
     pub fn deliver(&self, key: &str, payload: &Value) -> Result<()> {
-        if ["approval:", "budget:", "waive:"].iter().any(|p| key.starts_with(p)) {
+        if ["approval:", "budget:", "waive:", "input:"].iter().any(|p| key.starts_with(p)) {
             return Err(Error::Forbidden(format!("{key} can only be answered by a named human")));
         }
         self.store.deliver(key, payload)
+    }
+
+    /// Tokens and USD micros spent by runs created at or after `ts`, in any state. The intake
+    /// daily budget check: crossing it pauses intake, never running work.
+    pub fn spent_since(&self, ts: Timestamp) -> Result<(u64, u64)> {
+        let all = [
+            RunState::Queued, RunState::Running, RunState::AwaitingApproval, RunState::WaitingOnEvent,
+            RunState::RetryingStep, RunState::Escalated, RunState::Succeeded, RunState::Cancelled,
+        ];
+        let runs = self.store.list_runs(&all)?;
+        Ok(runs.iter().filter(|r| r.created_at >= ts).fold((0, 0), |(t, u), r| (t + r.spent_tokens, u + r.spent_usd_micros)))
     }
 
     /// Human resumes an escalated run; the failed step gets a fresh retry budget. Injection

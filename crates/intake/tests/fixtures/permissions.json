@@ -1,0 +1,9 @@
+{
+  "deploy_workflows": ["deploy-prod", "deploy-staging"],
+  "rules": [
+    {"source": "slack", "channel": "C024BE91L", "workflows": ["fix-bug", "triage"]},
+    {"source": "slack", "channel": "*", "actors": ["U061F7AUR"], "workflows": ["triage"]},
+    {"source": "github", "channel": "acme/shop", "workflows": ["fix-bug", "docs-fix", "deploy-staging"]},
+    {"source": "github", "channel": "acme/ops", "actors": ["release-bot"], "workflows": ["deploy-prod"]}
+  ]
+}
